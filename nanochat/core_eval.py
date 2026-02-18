@@ -217,12 +217,11 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 
-    # Forward the model, get the autoregressive loss and argmax prediction at each token
-    losses, predictions = forward_model(model, input_ids)
-
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':
+        # Forward the model, get the autoregressive loss and argmax prediction at each token
         # language modeling task is currently always batch size 1
+        losses, predictions = forward_model(model, input_ids)
         si = start_idxs[0]
         ei = end_idxs[0]
         # predictions[i] predict input_ids[i+1] autoregressively
@@ -230,9 +229,11 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         actual_tokens = input_ids[0, si:ei]
         is_correct = torch.all(predicted_tokens == actual_tokens).item()
     elif task_type in ['multiple_choice', 'schema']:
-        # For MC/schema: find the option with lowest average loss
-        mean_losses = [losses[i, si-1:ei-1].mean().item()
-                        for i, (si, ei) in enumerate(zip(start_idxs, end_idxs))]
+        # For MC/schema on low-VRAM GPUs, evaluate each option one-by-one to avoid OOM.
+        mean_losses = []
+        for i, (si, ei) in enumerate(zip(start_idxs, end_idxs)):
+            losses_i, _ = forward_model(model, input_ids[i:i+1])
+            mean_losses.append(losses_i[0, si-1:ei-1].mean().item())
         pred_idx = mean_losses.index(min(mean_losses))
         is_correct = pred_idx == item['gold']
     else:
@@ -245,18 +246,39 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
+
+    Strict failure behavior:
+    - If an example exceeds model context/rotary cache length, count it as incorrect (0).
+    - Any other runtime exception is raised so we can debug real bugs.
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    context_failures = torch.zeros(1, dtype=torch.float32, device=device)
+
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
-        correct[idx] = float(is_correct)
+        try:
+            is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+            correct[idx] = float(is_correct)
+        except Exception as e:
+            msg = str(e)
+            if "Sequence length grew beyond the rotary embeddings cache" in msg:
+                # Strict scoring rule: context-overflow queries count as wrong (0)
+                correct[idx] = 0.0
+                context_failures += 1
+            else:
+                raise
+
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(context_failures, op=dist.ReduceOp.SUM)
+
+    # expose failure count to caller for reporting
+    task_meta['context_failures'] = int(context_failures.item())
+
     # compute the mean
     mean_correct = correct.mean().item()
     return mean_correct

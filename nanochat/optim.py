@@ -35,6 +35,14 @@ def adamw_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
     """
+    # Move scalar hyperparameters to parameter device/dtype for eager compatibility
+    lr_t = lr_t.to(device=p.device, dtype=p.dtype)
+    wd_t = wd_t.to(device=p.device, dtype=p.dtype)
+    beta1_t = beta1_t.to(device=p.device, dtype=p.dtype)
+    beta2_t = beta2_t.to(device=p.device, dtype=p.dtype)
+    eps_t = eps_t.to(device=p.device, dtype=p.dtype)
+    step_t = step_t.to(device=p.device, dtype=p.dtype)
+
     # Weight decay (decoupled, applied before the update)
     p.mul_(1 - lr_t * wd_t)
     # Update running averages (lerp_ is cleaner and fuses well)
@@ -107,7 +115,7 @@ def muon_step_fused(
     """
 
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum = momentum_t.to(device=stacked_grads.device, dtype=stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
@@ -127,7 +135,7 @@ def muon_step_fused(
     g = X
 
     # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    beta2 = float(beta2_t.item())
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
@@ -140,8 +148,8 @@ def muon_step_fused(
     g = g * final_scale.to(g.dtype)
 
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
+    lr = lr_t.to(device=g.device, dtype=g.dtype)
+    wd = wd_t.to(device=g.device, dtype=g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
