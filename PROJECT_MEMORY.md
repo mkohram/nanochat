@@ -37,3 +37,12 @@ python -m scripts.local_base_train \
 - `scripts/base_train.py` and `scripts/base_eval.py` are kept clean for scale/upstream behavior.
 - `scripts/local_base_train.py` and `scripts/local_base_eval.py` are the local GTX 1060 paths.
 - If you re-enable evals, ensure checkpointing behavior matches intent (current script saves at end, after eval blocks).
+
+## Architecture guardrails (agreed)
+
+- Do **not** modify existing core modules for the new architecture path.
+- Keep existing GPT stack/config behavior intact.
+- New architecture logic will live in a new module: `nanochat/double_helix.py`.
+- Add new optional config flags only (no breaking/removing existing `GPTConfig` fields).
+- Build new layers/blocks there (read phase → transformer stack → write phase), and wire in cleanly behind a new path/flag.
+- Shared intent notes live in `GDH_SHARED_UNDERSTANDING.md`.

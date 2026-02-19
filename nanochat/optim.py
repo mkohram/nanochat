@@ -238,32 +238,42 @@ class MuonAdamW(torch.optim.Optimizer):
         """
         Muon update for all params in the group (stacked for efficiency).
         Lazy init the state, fill in all 0-D tensors, call the fused kernel.
+
+        Some parameters can legitimately have grad=None (e.g. zero-init mixer paths on
+        their first few steps). We skip those parameters for this optimizer step.
         """
         params: list[Tensor] = group['params']
         if not params:
             return
 
-        # Get or create group-level buffers (stored in first param's state for convenience)
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
+        active_indices = [i for i, p in enumerate(params) if p.grad is not None]
+        if not active_indices:
+            return
+        active_params = [params[i] for i in active_indices]
 
-        # Momentum for every individual parameter
-        if "momentum_buffer" not in state:
+        # Keep state keyed to the first param in the full group for stability.
+        p0 = params[0]
+        state = self.state[p0]
+        num_params = len(params)
+        shape, device, dtype = p0.shape, p0.device, p0.dtype
+
+        # Momentum for every parameter in the full group (indexed by active_indices below)
+        if "momentum_buffer" not in state or state["momentum_buffer"].shape[0] != num_params:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        momentum_buffer = state["momentum_buffer"]
 
         # Second momentum buffer is factored, either per-row or per-column
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+        state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+        if "second_momentum_buffer" not in state or state["second_momentum_buffer"].shape != state_shape:
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        second_momentum_buffer = state["second_momentum_buffer"]
+
         red_dim = -1 if shape[-2] >= shape[-1] else -2
+        idx = torch.tensor(active_indices, device=device, dtype=torch.long)
+        momentum_buffer = state["momentum_buffer"].index_select(0, idx)
+        second_momentum_buffer = state["second_momentum_buffer"].index_select(0, idx)
 
         # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
+        stacked_grads = torch.stack([params[i].grad for i in active_indices])
+        stacked_params = torch.stack(active_params)
 
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
@@ -285,8 +295,10 @@ class MuonAdamW(torch.optim.Optimizer):
             red_dim,
         )
 
-        # Copy back to original params
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+        # Write updated states and params back only for active indices
+        state["momentum_buffer"].index_copy_(0, idx, momentum_buffer)
+        state["second_momentum_buffer"].index_copy_(0, idx, second_momentum_buffer)
+        torch._foreach_copy_(active_params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
     def step(self):
@@ -379,6 +391,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
+            if grad is None:
+                continue
             if p.numel() < 1024:
                 # Small params: all_reduce (no scatter/gather needed)
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
@@ -395,29 +409,39 @@ class DistMuonAdamW(torch.optim.Optimizer):
     def _reduce_muon(self, group: dict, world_size: int) -> dict:
         """Launch async reduce op for Muon group. Returns info dict."""
         params = group['params']
-        chunk_size = (len(params) + world_size - 1) // world_size
+        active_params = [p for p in params if p.grad is not None]
+        if not active_params:
+            return dict(skip=True, active_params=[])
+
+        chunk_size = (len(active_params) + world_size - 1) // world_size
         padded_num_params = chunk_size * world_size
-        p = params[0]
+        p = active_params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
 
         # Stack grads and zero-pad to padded_num_params
-        grad_stack = torch.stack([p.grad for p in params])
+        grad_stack = torch.stack([p.grad for p in active_params])
         stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
-        if len(params) < padded_num_params:
-            stacked_grads[len(params):].zero_()
+        stacked_grads[:len(active_params)].copy_(grad_stack)
+        if len(active_params) < padded_num_params:
+            stacked_grads[len(active_params):].zero_()
 
         # Reduce_scatter to get this rank's chunk
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
 
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(
+            skip=False,
+            future=future,
+            grad_chunk=grad_chunk,
+            stacked_grads=stacked_grads,
+            chunk_size=chunk_size,
+            active_params=active_params,
+        )
 
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
-        for p in group['params']:
-            pinfo = param_infos[p]
+        for p, pinfo in param_infos.items():
             pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']
             state = self.state[p]
@@ -456,8 +480,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
         """Wait for reduce, compute Muon updates, launch gather."""
+        if info.get("skip", False):
+            return
+
         info['future'].wait()
-        params = group['params']
+        params = info['active_params']
         chunk_size = info['chunk_size']
         grad_chunk = info['grad_chunk']
         p = params[0]
@@ -468,11 +495,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
 
         # Get or create group-level state
-        state = self.state[p]
-        if "momentum_buffer" not in state:
+        state = self.state[group['params'][0]]
+        if "momentum_buffer" not in state or state["momentum_buffer"].shape[0] != chunk_size:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+        state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+        if "second_momentum_buffer" not in state or state["second_momentum_buffer"].shape != state_shape:
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 

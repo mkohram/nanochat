@@ -29,7 +29,7 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, norm as gpt_norm
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -55,7 +55,15 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", type=str, default="L", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL'). Local default is L for SDPA/GTX stability.")
+parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "gdh"], help="model architecture path")
+parser.add_argument("--gdh-slots", type=int, default=16, help="number of GDH sidecar slots (used when --arch gdh)")
+parser.add_argument("--gdh-write-heads", type=int, default=-1, help="GDH write heads (-1 = use n_head)")
+parser.add_argument("--gate-log-every", type=int, default=10, help="log GDH gate telemetry every N steps (-1 = disable)")
+parser.add_argument("--gate-open-threshold", type=float, default=0.55, help="threshold used for gate open fraction telemetry")
+parser.add_argument("--gdh-out-hist-every", type=int, default=100, help="log GDH output-state histograms every N steps (-1 = disable)")
+parser.add_argument("--gdh-out-hist-max-points", type=int, default=4096, help="max tensor elements to include per output-state histogram")
+parser.add_argument("--freeze-local-path", action="store_true", help="freeze local backbone path (transformer blocks + value embeddings)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -92,27 +100,7 @@ def trace(msg):
     if TRACE_STARTUP:
         print(f"[startup +{time.perf_counter() - _t0:7.3f}s] {msg}", flush=True)
 
-# ----------------------------------------------------------------------------
-# Backbone lock (frozen baseline architecture)
-# Keep these fixed so architecture experiments only happen where intended.
-BACKBONE_LOCK = {
-    "depth": 10,
-    "max_seq_len": 256,
-    "head_dim": 32,
-    "window_pattern": "L",
-}
-
-for k, v in BACKBONE_LOCK.items():
-    if getattr(args, k) != v:
-        print0(f"Backbone lock active: overriding --{k.replace('_','-')}={getattr(args, k)} -> {v}")
-        setattr(args, k, v)
-
-# model_dim = depth * aspect_ratio; keep baseline emb dim = 640
-if args.aspect_ratio != 64:
-    print0(f"Backbone lock active: overriding --aspect-ratio={args.aspect_ratio} -> 64")
-    args.aspect_ratio = 64
-
-# keep logged user config aligned with locked values
+# Keep logged user config exactly as provided (no local architecture lock overrides).
 user_config = vars(args).copy()
 
 # -----------------------------------------------------------------------------
@@ -176,6 +164,9 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        arch=args.arch,
+        gdh_slots=args.gdh_slots,
+        gdh_write_heads=args.gdh_write_heads,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -197,7 +188,8 @@ trace("model.init_weights done")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+default_tag = f"d{args.depth}" if args.arch == "baseline" else f"{args.arch}-d{args.depth}"
+output_dirname = args.model_tag if args.model_tag else default_tag # e.g. d12, gdh-d1
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
@@ -205,6 +197,20 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+if args.freeze_local_path:
+    frozen_params = 0
+    for p in model.transformer.h.parameters():
+        p.requires_grad_(False)
+        frozen_params += p.numel()
+    for p in model.value_embeds.parameters():
+        p.requires_grad_(False)
+        frozen_params += p.numel()
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print0(
+        f"Freezing local path (transformer.h + value_embeds): {frozen_params:,} params frozen; "
+        f"{trainable_params:,} params remain trainable"
+    )
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -425,6 +431,117 @@ def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
 # -----------------------------------------------------------------------------
+# GDH gate telemetry helper
+
+def _to_wandb_histogram(t: torch.Tensor, max_points: int):
+    flat = t.detach().float().reshape(-1)
+    if flat.numel() == 0:
+        return wandb.Histogram([0.0])
+    if flat.numel() > max_points:
+        stride = max(flat.numel() // max_points, 1)
+        flat = flat[::stride][:max_points]
+    return wandb.Histogram(flat.cpu().tolist())
+
+
+def collect_gdh_probe_telemetry(
+    m: GPT,
+    idx_tokens: torch.Tensor,
+    open_threshold: float,
+    *,
+    include_out_hist: bool,
+    out_hist_max_points: int,
+):
+    """Collect GDH probe telemetry from one token batch.
+
+    Includes:
+    - gate stats
+    - output-state (sidecar) stats
+    - optional output-state histograms
+    """
+    if getattr(m, "arch", "baseline") != "gdh":
+        return {}
+
+    with torch.no_grad():
+        autocast_gate = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if idx_tokens.device.type == "cuda" else nullcontext()
+        with autocast_gate:
+            bsz, n_tokens = idx_tokens.shape
+            x = m.transformer.wte(idx_tokens)
+            x = gpt_norm(x)
+            x0 = x
+
+            gdh_slots = m.config.gdh_slots
+            gdh_heads = m.config.n_head if m.config.gdh_write_heads <= 0 else m.config.gdh_write_heads
+            sidecar = torch.zeros(bsz, n_tokens, gdh_slots, m.config.n_embd, device=x.device, dtype=x.dtype)
+            cos_sin = m.cos[:, :n_tokens], m.sin[:, :n_tokens]
+
+            telemetry = {}
+            gate_means, gate_stds, gate_open_fracs = [], [], []
+            out_means, out_abs_means, out_stds = [], [], []
+            delta_abs_means = []
+
+            for i, block in enumerate(m.transformer.h):
+                x = m.resid_lambdas[i] * x + m.x0_lambdas[i] * x0
+
+                x_read = gpt_norm(x)
+                g = torch.sigmoid(torch.matmul(x_read, m.gdh_read[i].W_g_read)).squeeze(-1).float()
+
+                gate_mean = g.mean().item()
+                gate_std = g.std(unbiased=False).item()
+                gate_open = (g > open_threshold).float().mean().item()
+                gate_means.append(gate_mean)
+                gate_stds.append(gate_std)
+                gate_open_fracs.append(gate_open)
+
+                ve = m.value_embeds[str(i)](idx_tokens) if str(i) in m.value_embeds else None
+                x = m.gdh_read[i].forward_sequence(x, sidecar, eps=1e-6)
+                x = block(x, ve, cos_sin, m.window_sizes[i], kv_cache=None)
+                delta = m.gdh_write[i].forward_sequence_delta(
+                    x,
+                    sidecar,
+                    n_write_heads=gdh_heads,
+                    eps=1e-6,
+                )
+                sidecar = sidecar + torch.cumsum(delta, dim=1)
+
+                delta_f = delta.float()
+                sidecar_f = sidecar.float()
+
+                out_mean = sidecar_f.mean().item()
+                out_abs_mean = sidecar_f.abs().mean().item()
+                out_std = sidecar_f.std(unbiased=False).item()
+                delta_abs_mean = delta_f.abs().mean().item()
+
+                out_means.append(out_mean)
+                out_abs_means.append(out_abs_mean)
+                out_stds.append(out_std)
+                delta_abs_means.append(delta_abs_mean)
+
+                telemetry[f"gdh/layer_{i}/gate_mean"] = gate_mean
+                telemetry[f"gdh/layer_{i}/gate_std"] = gate_std
+                telemetry[f"gdh/layer_{i}/gate_open_frac"] = gate_open
+
+                telemetry[f"gdh/layer_{i}/out_state_mean"] = out_mean
+                telemetry[f"gdh/layer_{i}/out_state_abs_mean"] = out_abs_mean
+                telemetry[f"gdh/layer_{i}/out_state_std"] = out_std
+                telemetry[f"gdh/layer_{i}/delta_abs_mean"] = delta_abs_mean
+                telemetry[f"gdh/layer_{i}/out_state_final_token_abs_mean"] = sidecar_f[:, -1].abs().mean().item()
+
+                if include_out_hist:
+                    telemetry[f"gdh/layer_{i}/out_state_hist"] = _to_wandb_histogram(sidecar_f, out_hist_max_points)
+
+    telemetry.update({
+        "gdh/gate_mean": sum(gate_means) / len(gate_means),
+        "gdh/gate_std": sum(gate_stds) / len(gate_stds),
+        "gdh/gate_open_frac": sum(gate_open_fracs) / len(gate_open_fracs),
+        "gdh/out_state_mean": sum(out_means) / len(out_means),
+        "gdh/out_state_abs_mean": sum(out_abs_means) / len(out_abs_means),
+        "gdh/out_state_std": sum(out_stds) / len(out_stds),
+        "gdh/delta_abs_mean": sum(delta_abs_means) / len(delta_abs_means),
+    })
+    return telemetry
+
+
+# -----------------------------------------------------------------------------
 # Training loop
 
 # Loop state (variables updated by the training loop)
@@ -591,6 +708,39 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+
+    gate_log_due = args.arch == "gdh" and args.gate_log_every > 0 and (step % args.gate_log_every == 0)
+    out_hist_due = args.arch == "gdh" and args.gdh_out_hist_every > 0 and (step % args.gdh_out_hist_every == 0)
+    gdh_probe_due = args.arch == "gdh" and (gate_log_due or out_hist_due)
+    gdh_probe_telemetry = {}
+
+    if gdh_probe_due:
+        gdh_probe_telemetry = collect_gdh_probe_telemetry(
+            orig_model,
+            x,
+            args.gate_open_threshold,
+            include_out_hist=out_hist_due,
+            out_hist_max_points=args.gdh_out_hist_max_points,
+        )
+        if gdh_probe_telemetry:
+            if gate_log_due:
+                print0(
+                    f"gdh gate | mean: {gdh_probe_telemetry['gdh/gate_mean']:.4f} | "
+                    f"std: {gdh_probe_telemetry['gdh/gate_std']:.4f} | "
+                    f"open>{args.gate_open_threshold:.2f}: {gdh_probe_telemetry['gdh/gate_open_frac']:.3f}"
+                )
+            print0(
+                f"gdh out_state | mean: {gdh_probe_telemetry['gdh/out_state_mean']:.6f} | "
+                f"abs_mean: {gdh_probe_telemetry['gdh/out_state_abs_mean']:.6f} | "
+                f"std: {gdh_probe_telemetry['gdh/out_state_std']:.6f}"
+            )
+            wandb_run.log({
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "total_training_time": total_training_time,
+                **gdh_probe_telemetry,
+            })
+
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -602,6 +752,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            **gdh_probe_telemetry,
         }
         wandb_run.log(log_data)
 

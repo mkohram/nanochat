@@ -24,6 +24,7 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+from nanochat.double_helix import GDHReadCore, GDHWriteCore
 
 @dataclass
 class GPTConfig:
@@ -37,6 +38,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Architecture selection
+    arch: str = "baseline"  # baseline|gdh
+    # GDH knobs (used when arch == "gdh")
+    gdh_slots: int = 16
+    gdh_write_heads: int = -1  # -1 means use n_head
 
 
 def norm(x):
@@ -175,6 +181,25 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Optional GDH wrappers around the standard block process path
+        self.arch = config.arch.lower()
+        if self.arch not in {"baseline", "gdh"}:
+            raise ValueError(f"Unknown arch: {config.arch}. Use baseline or gdh.")
+        if self.arch == "gdh":
+            self.gdh_read = nn.ModuleList([GDHReadCore(config.n_embd) for _ in range(config.n_layer)])
+            self.gdh_write = nn.ModuleList([GDHWriteCore(config.n_embd, config.gdh_slots) for _ in range(config.n_layer)])
+
+            # Tie the designated global GDH weights across layers.
+            self._tie_gdh_global_weights()
+
+            if config.n_layer == 1:
+                print0(
+                    "WARNING: GDH with n_layer=1 has no downstream layer to consume sidecar writes; "
+                    "sidecar dynamics are expected to be minimal in this setup."
+                )
+        else:
+            self.gdh_read = None
+            self.gdh_write = None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -184,6 +209,26 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+
+    def _tie_gdh_global_weights(self):
+        """Tie designated GDH global weights across layers.
+
+        Note: model.to_empty can break shared Parameter references, so we call this
+        in init_weights as well to re-establish ties before initialization.
+        """
+        if self.arch != "gdh" or self.config.n_layer <= 1:
+            return
+
+        # Use layer-0 tensors as canonical shared parameters.
+        shared_k_read = self.gdh_read[0].W_k_read_global
+        shared_v_read = self.gdh_read[0].W_v_read_global
+        shared_q_write = self.gdh_write[0].W_q_write_global
+
+        for read_core in self.gdh_read[1:]:
+            read_core.W_k_read_global = shared_k_read
+            read_core.W_v_read_global = shared_v_read
+        for write_core in self.gdh_write[1:]:
+            write_core.W_q_write_global = shared_q_write
 
     @torch.no_grad()
     def init_weights(self):
@@ -200,6 +245,9 @@ class GPT(nn.Module):
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
             mlp.c_proj:      zeros
         """
+
+        # model.to_empty may break parameter tying; restore GDH shared refs first
+        self._tie_gdh_global_weights()
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
@@ -229,6 +277,17 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
+        # GDH read/write wrappers (when enabled)
+        if self.arch == "gdh":
+            gdh_std = n_embd**-0.5
+            for read_core, write_core in zip(self.gdh_read, self.gdh_write):
+                # Option-1 inter-layer memory bootstrap:
+                # - keep read output mixer zero-init (near-baseline residual behavior)
+                # - keep write output mixer non-zero so sidecar updates can form immediately
+                # This avoids the all-zero Jacobian dead-state from zeroing both mixers.
+                read_core.reset_parameters(std=gdh_std, zero_init_mixer=True)
+                write_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -239,6 +298,9 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
+            if self.arch == "gdh":
+                self.gdh_read.to(dtype=torch.bfloat16)
+                self.gdh_write.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -333,14 +395,19 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        gdh_matrices = 0 if self.arch != "gdh" else (
+            sum(p.numel() for p in self.gdh_read.parameters()) +
+            sum(p.numel() for p in self.gdh_write.parameters())
+        )
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + gdh_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'gdh_matrices': gdh_matrices,
             'scalars': scalars,
             'total': total,
         }
@@ -350,13 +417,16 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        transformer_matrix_params = list(self.transformer.h.parameters())
+        gdh_matrix_params = []
+        if self.arch == "gdh":
+            gdh_matrix_params = list(self.gdh_read.parameters()) + list(self.gdh_write.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(transformer_matrix_params) + len(gdh_matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -371,9 +441,17 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+
+        # GDH path is still early-stage; keep it on AdamW to avoid Muon instability on tiny shapes.
+        if gdh_matrix_params:
+            param_groups.append(dict(
+                kind='adamw', params=gdh_matrix_params, lr=matrix_lr,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
+
+        # Muon groups (transformer matrix params only, grouped by shape for stacking)
+        for shape in sorted({p.shape for p in transformer_matrix_params}):
+            group_params = [p for p in transformer_matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
@@ -400,10 +478,31 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+
+        use_gdh = self.arch == "gdh"
+        if use_gdh:
+            if kv_cache is not None:
+                raise NotImplementedError("GDH path with kv_cache is not implemented yet")
+            gdh_slots = self.config.gdh_slots
+            gdh_heads = self.config.n_head if self.config.gdh_write_heads <= 0 else self.config.gdh_write_heads
+            assert self.config.n_embd % gdh_heads == 0, "n_embd must be divisible by gdh write heads"
+            sidecar = torch.zeros(B, T, gdh_slots, self.config.n_embd, device=x.device, dtype=x.dtype)
+
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            if use_gdh:
+                x = self.gdh_read[i].forward_sequence(x, sidecar, eps=1e-6)
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if use_gdh:
+                delta = self.gdh_write[i].forward_sequence_delta(
+                    x,
+                    sidecar,
+                    n_write_heads=gdh_heads,
+                    eps=1e-6,
+                )
+                sidecar = sidecar + torch.cumsum(delta, dim=1)
+
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -438,7 +537,11 @@ class GPT(nn.Module):
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
+            if device.type == "cuda":
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = self.forward(ids) # (B, T, vocab_size)
+            else:
+                logits = self.forward(ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
