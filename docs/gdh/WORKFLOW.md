@@ -52,7 +52,7 @@ Notes:
 Run:
 
 ```bash
-.venv/bin/python -m pytest -q tests/gdh/test_oracle.py
+.venv/bin/python -m pytest -q tests/gdh
 ```
 
 Pass condition:
@@ -66,7 +66,7 @@ scripts/gdh_checklist.sh
 
 ### B. Compatibility checks
 - If naming/state keys changed, ensure legacy checkpoint loading still works.
-- Keep migration/alias coverage in `tests/gdh/test_oracle.py`.
+- Keep migration/alias coverage in the GDH suite (e.g., `tests/gdh/test_oracle.py`).
 
 ### C. Docs sync
 When equations/behavior changed, update:

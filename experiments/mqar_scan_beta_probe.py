@@ -396,6 +396,29 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
     model.train()
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
+
+    lr_decay_iters = args.lr_decay_iters if args.lr_decay_iters > 0 else args.steps
+    if lr_decay_iters <= 0:
+        raise ValueError("lr_decay_iters must be > 0")
+    base_lr = float(args.lr)
+    min_lr = float(args.min_lr)
+    if min_lr < 0.0:
+        raise ValueError("min_lr must be >= 0")
+    if min_lr > base_lr:
+        raise ValueError("min_lr must be <= lr")
+
+    def get_lr(step_idx: int) -> float:
+        if step_idx >= lr_decay_iters:
+            return min_lr
+        ratio = float(step_idx) / float(lr_decay_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+        return min_lr + coeff * (base_lr - min_lr)
+
+    print(
+        f"[beta={beta}] lr_schedule base={base_lr:.6g} min={min_lr:.6g} decay_iters={lr_decay_iters}",
+        flush=True,
+    )
+
     use_cuda = device == "cuda"
     ac = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_cuda else nullcontext()
 
@@ -438,6 +461,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         rec: dict[str, Any] = {
             "step": step,
             "beta": beta,
+            "lr": float(opt.param_groups[0]["lr"]),
             "eval_total": float(eval_total.item()),
             "eval_ce": float(eval_ce.item()),
             "eval_usage_loss": float(eval_usage.item()),
@@ -474,7 +498,8 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         cos_txt = "n/a" if rec["slot_cos_l_last"] is None else f"{rec['slot_cos_l_last']:.4f}"
         print(
             f"[beta={beta}] step={step} eval_acc1={rec['eval_acc_top1']:.4f} "
-            f"eval_mrr={rec['eval_mrr']:.4f} eval_ce={rec['eval_ce']:.4f} slot_cos={cos_txt}",
+            f"eval_mrr={rec['eval_mrr']:.4f} eval_ce={rec['eval_ce']:.4f} "
+            f"slot_cos={cos_txt} lr={rec['lr']:.6g}",
             flush=True,
         )
 
@@ -483,6 +508,11 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
     eval_record(step=0)
 
     for step in range(1, args.steps + 1):
+        step_idx = step - 1
+        lr_t = get_lr(step_idx)
+        for group in opt.param_groups:
+            group["lr"] = lr_t
+
         idx, tgt = make_mqar_batch(args, batch_size=args.batch_size, device=device)
 
         opt.zero_grad(set_to_none=True)
@@ -643,6 +673,8 @@ def main() -> None:
     p.add_argument("--eval-batch-size", type=int, default=8)
     p.add_argument("--eval-topk", type=int, default=5)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr-decay-iters", type=int, default=-1, help="cosine LR decay horizon in optimizer steps (-1 => use --steps)")
+    p.add_argument("--min-lr", type=float, default=0.0, help="minimum LR at/after decay horizon")
 
     # Optional strict stress requirement.
     p.add_argument("--enforce-capacity-stress", action="store_true", help="require n_pairs > gdh_slots")
