@@ -59,10 +59,15 @@ parser.add_argument("--window-pattern", type=str, default="L", help="sliding win
 parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "gdh"], help="model architecture path")
 parser.add_argument("--gdh-slots", type=int, default=16, help="number of GDH sidecar slots (used when --arch gdh)")
 parser.add_argument("--gdh-write-heads", type=int, default=-1, help="GDH write heads (-1 = use n_head)")
+parser.add_argument("--gdh-no-read-gate", action="store_true", help="disable GDH read gate (always-on sidecar read path)")
+parser.add_argument("--gdh-no-write-brain", action="store_true", help="disable GDH write-space residual brain (Linear->ReLU²->Linear)")
+parser.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4, help="GDH write-brain hidden width multiplier (hidden = mult * D)")
 parser.add_argument("--gate-log-every", type=int, default=10, help="log GDH gate telemetry every N steps (-1 = disable)")
 parser.add_argument("--gate-open-threshold", type=float, default=0.55, help="threshold used for gate open fraction telemetry")
+parser.add_argument("--train-log-every", type=int, default=10, help="log train metrics every N steps to align baseline/GDH telemetry density (-1 = disable)")
 parser.add_argument("--gdh-out-hist-every", type=int, default=100, help="log GDH output-state histograms every N steps (-1 = disable)")
-parser.add_argument("--gdh-out-hist-max-points", type=int, default=4096, help="max tensor elements to include per output-state histogram")
+parser.add_argument("--gdh-weight-hist-every", type=int, default=100, help="log GDH read-weight histograms (W_o_read + shared read globals) every N steps (-1 = disable)")
+parser.add_argument("--gdh-out-hist-max-points", type=int, default=4096, help="max tensor elements to include per histogram")
 parser.add_argument("--freeze-local-path", action="store_true", help="freeze local backbone path (transformer blocks + value embeddings)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -82,6 +87,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--resume-model-only", action="store_true", help="when resuming, load model/dataloader/step but reinitialize optimizer state")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
@@ -125,7 +131,19 @@ else:
 use_dummy_wandb = args.run == "dummy" or not master_process
 trace(f"wandb init start (dummy={use_dummy_wandb}, run={args.run})")
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+if not use_dummy_wandb:
+    # Use explicit training step on the x-axis instead of wandb internal _step counter.
+    # Keep the metric name as `step` for cleaner dashboards.
+    wandb_run.define_metric("step")
+    wandb_run.define_metric("*", step_metric="step")
 trace("wandb init done")
+
+
+def log_to_wandb(step_value, payload):
+    wandb_run.log({
+        "step": step_value,
+        **payload,
+    })
 
 # Flash Attention status
 if HAS_FA3:
@@ -167,6 +185,9 @@ def build_model_meta(depth):
         arch=args.arch,
         gdh_slots=args.gdh_slots,
         gdh_write_heads=args.gdh_write_heads,
+        gdh_use_read_gate=not args.gdh_no_read_gate,
+        gdh_use_write_brain=not args.gdh_no_write_brain,
+        gdh_write_brain_hidden_mult=args.gdh_write_brain_hidden_mult,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -193,8 +214,17 @@ output_dirname = args.model_tag if args.model_tag else default_tag # e.g. d12, g
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    if args.resume_model_only:
+        print0(f"Resuming model/dataloader state from step {args.resume_from_step} (optimizer reinitialized)")
+    else:
+        print0(f"Resuming optimization from step {args.resume_from_step}")
+    model_data, optimizer_data, meta_data = load_checkpoint(
+        checkpoint_dir,
+        args.resume_from_step,
+        device,
+        load_optimizer=not args.resume_model_only,
+        rank=ddp_rank,
+    )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -369,7 +399,7 @@ optimizer = model.setup_optimizer(
 )
 trace("optimizer setup done")
 
-if resuming:
+if resuming and not args.resume_model_only:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
@@ -449,6 +479,7 @@ def collect_gdh_probe_telemetry(
     open_threshold: float,
     *,
     include_out_hist: bool,
+    include_weight_hist: bool,
     out_hist_max_points: int,
 ):
     """Collect GDH probe telemetry from one token batch.
@@ -457,6 +488,7 @@ def collect_gdh_probe_telemetry(
     - gate stats
     - output-state (sidecar) stats
     - optional output-state histograms
+    - optional read-weight histograms (W_o_read + shared read globals)
     """
     if getattr(m, "arch", "baseline") != "gdh":
         return {}
@@ -478,12 +510,17 @@ def collect_gdh_probe_telemetry(
             gate_means, gate_stds, gate_open_fracs = [], [], []
             out_means, out_abs_means, out_stds = [], [], []
             delta_abs_means = []
+            use_read_gate = bool(getattr(m.config, "gdh_use_read_gate", True))
+            use_write_brain = bool(getattr(m.config, "gdh_use_write_brain", True))
 
             for i, block in enumerate(m.transformer.h):
                 x = m.resid_lambdas[i] * x + m.x0_lambdas[i] * x0
 
                 x_read = gpt_norm(x)
-                g = torch.sigmoid(torch.matmul(x_read, m.gdh_read[i].W_g_read)).squeeze(-1).float()
+                if use_read_gate:
+                    g = torch.sigmoid(torch.matmul(x_read, m.gdh_read[i].W_g_read)).squeeze(-1).float()
+                else:
+                    g = torch.ones(bsz, n_tokens, device=x.device, dtype=torch.float32)
 
                 gate_mean = g.mean().item()
                 gate_std = g.std(unbiased=False).item()
@@ -529,7 +566,86 @@ def collect_gdh_probe_telemetry(
                 if include_out_hist:
                     telemetry[f"gdh/layer_{i}/out_state_hist"] = _to_wandb_histogram(sidecar_f, out_hist_max_points)
 
+                if include_weight_hist:
+                    w_o_read_f = m.gdh_read[i].W_o_read.float()
+                    telemetry[f"gdh/layer_{i}/W_o_read_abs_mean"] = w_o_read_f.abs().mean().item()
+                    telemetry[f"gdh/layer_{i}/W_o_read_std"] = w_o_read_f.std(unbiased=False).item()
+                    telemetry[f"gdh/layer_{i}/W_o_read_hist"] = _to_wandb_histogram(w_o_read_f, out_hist_max_points)
+
+    if include_weight_hist and len(m.gdh_read) > 0:
+        read0 = m.gdh_read[0]
+        w_k_read_global = read0.W_k_read_global.float()
+        w_v_read_global = read0.W_v_read_global.float()
+
+        telemetry["gdh/global/W_k_read_global_abs_mean"] = w_k_read_global.abs().mean().item()
+        telemetry["gdh/global/W_k_read_global_std"] = w_k_read_global.std(unbiased=False).item()
+        telemetry["gdh/global/W_k_read_global_hist"] = _to_wandb_histogram(w_k_read_global, out_hist_max_points)
+
+        telemetry["gdh/global/W_v_read_global_abs_mean"] = w_v_read_global.abs().mean().item()
+        telemetry["gdh/global/W_v_read_global_std"] = w_v_read_global.std(unbiased=False).item()
+        telemetry["gdh/global/W_v_read_global_hist"] = _to_wandb_histogram(w_v_read_global, out_hist_max_points)
+
+        write0 = m.gdh_write[0]
+        e_slots = write0.E_slots.float()
+        w_q_slots_global = write0.W_q_slots_global.float()
+
+        telemetry["gdh/global/E_slots_abs_mean"] = e_slots.abs().mean().item()
+        telemetry["gdh/global/E_slots_std"] = e_slots.std(unbiased=False).item()
+        telemetry["gdh/global/E_slots_hist"] = _to_wandb_histogram(e_slots, out_hist_max_points)
+
+        telemetry["gdh/global/W_q_slots_global_abs_mean"] = w_q_slots_global.abs().mean().item()
+        telemetry["gdh/global/W_q_slots_global_std"] = w_q_slots_global.std(unbiased=False).item()
+        telemetry["gdh/global/W_q_slots_global_hist"] = _to_wandb_histogram(w_q_slots_global, out_hist_max_points)
+
+        if getattr(write0, "W_write_mlp_in_global", None) is not None:
+            w_write_mlp_in = write0.W_write_mlp_in_global.float()
+            w_write_mlp_out = write0.W_write_mlp_out_global.float()
+            telemetry["gdh/global/W_write_mlp_in_abs_mean"] = w_write_mlp_in.abs().mean().item()
+            telemetry["gdh/global/W_write_mlp_in_std"] = w_write_mlp_in.std(unbiased=False).item()
+            telemetry["gdh/global/W_write_mlp_in_hist"] = _to_wandb_histogram(w_write_mlp_in, out_hist_max_points)
+            telemetry["gdh/global/W_write_mlp_out_abs_mean"] = w_write_mlp_out.abs().mean().item()
+            telemetry["gdh/global/W_write_mlp_out_std"] = w_write_mlp_out.std(unbiased=False).item()
+            telemetry["gdh/global/W_write_mlp_out_hist"] = _to_wandb_histogram(w_write_mlp_out, out_hist_max_points)
+
+        if len(m.gdh_read) > 1:
+            k_tied = all(
+                m.gdh_read[j].W_k_read_global.data_ptr() == read0.W_k_read_global.data_ptr()
+                for j in range(1, len(m.gdh_read))
+            )
+            v_tied = all(
+                m.gdh_read[j].W_v_read_global.data_ptr() == read0.W_v_read_global.data_ptr()
+                for j in range(1, len(m.gdh_read))
+            )
+            e_slots_tied = all(
+                m.gdh_write[j].E_slots.data_ptr() == write0.E_slots.data_ptr()
+                for j in range(1, len(m.gdh_write))
+            )
+            q_slots_tied = all(
+                m.gdh_write[j].W_q_slots_global.data_ptr() == write0.W_q_slots_global.data_ptr()
+                for j in range(1, len(m.gdh_write))
+            )
+
+            telemetry["gdh/global/W_k_read_global_tied"] = float(k_tied)
+            telemetry["gdh/global/W_v_read_global_tied"] = float(v_tied)
+            telemetry["gdh/global/E_slots_tied"] = float(e_slots_tied)
+            telemetry["gdh/global/W_q_slots_global_tied"] = float(q_slots_tied)
+
+            if getattr(write0, "W_write_mlp_in_global", None) is not None:
+                write_mlp_in_tied = all(
+                    m.gdh_write[j].W_write_mlp_in_global.data_ptr() == write0.W_write_mlp_in_global.data_ptr()
+                    for j in range(1, len(m.gdh_write))
+                )
+                write_mlp_out_tied = all(
+                    m.gdh_write[j].W_write_mlp_out_global.data_ptr() == write0.W_write_mlp_out_global.data_ptr()
+                    for j in range(1, len(m.gdh_write))
+                )
+                telemetry["gdh/global/W_write_mlp_in_tied"] = float(write_mlp_in_tied)
+                telemetry["gdh/global/W_write_mlp_out_tied"] = float(write_mlp_out_tied)
+
     telemetry.update({
+        "gdh/use_read_gate": float(use_read_gate),
+        "gdh/use_write_brain": float(use_write_brain),
+        "gdh/write_brain_hidden_mult": float(getattr(m.config, "gdh_write_brain_hidden_mult", 0)),
         "gdh/gate_mean": sum(gate_means) / len(gate_means),
         "gdh/gate_std": sum(gate_stds) / len(gate_stds),
         "gdh/gate_open_frac": sum(gate_open_fracs) / len(gate_open_fracs),
@@ -583,8 +699,7 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
-            "step": step,
+        log_to_wandb(step, {
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
@@ -600,8 +715,7 @@ while True:
         with disable_fp8(orig_model), autocast_ctx:
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
+        log_to_wandb(step, {
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
@@ -711,7 +825,9 @@ while True:
 
     gate_log_due = args.arch == "gdh" and args.gate_log_every > 0 and (step % args.gate_log_every == 0)
     out_hist_due = args.arch == "gdh" and args.gdh_out_hist_every > 0 and (step % args.gdh_out_hist_every == 0)
-    gdh_probe_due = args.arch == "gdh" and (gate_log_due or out_hist_due)
+    weight_hist_due = args.arch == "gdh" and args.gdh_weight_hist_every > 0 and (step % args.gdh_weight_hist_every == 0)
+    train_log_due = args.train_log_every > 0 and (step % args.train_log_every == 0)
+    gdh_probe_due = args.arch == "gdh" and (gate_log_due or out_hist_due or weight_hist_due)
     gdh_probe_telemetry = {}
 
     if gdh_probe_due:
@@ -720,6 +836,7 @@ while True:
             x,
             args.gate_open_threshold,
             include_out_hist=out_hist_due,
+            include_weight_hist=weight_hist_due,
             out_hist_max_points=args.gdh_out_hist_max_points,
         )
         if gdh_probe_telemetry:
@@ -734,16 +851,18 @@ while True:
                 f"abs_mean: {gdh_probe_telemetry['gdh/out_state_abs_mean']:.6f} | "
                 f"std: {gdh_probe_telemetry['gdh/out_state_std']:.6f}"
             )
-            wandb_run.log({
-                "step": step,
-                "total_training_flops": flops_so_far,
-                "total_training_time": total_training_time,
-                **gdh_probe_telemetry,
-            })
 
-    if step % 100 == 0:
+    # If GDH probe is due but train logging isn't, emit a telemetry-only point.
+    # If both are due, emit a single combined point in the train log below.
+    if gdh_probe_telemetry and not train_log_due:
+        log_to_wandb(step, {
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            **gdh_probe_telemetry,
+        })
+
+    if train_log_due:
         log_data = {
-            "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
@@ -754,7 +873,7 @@ while True:
             "train/epoch": epoch,
             **gdh_probe_telemetry,
         }
-        wandb_run.log(log_data)
+        log_to_wandb(step, log_data)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

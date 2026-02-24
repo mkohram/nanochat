@@ -1,7 +1,7 @@
 # GDH Step-by-Step Plan (Test-First, Slow Execution)
 
 Date: 2026-02-18
-Status: In progress (oracle + scaffold phase complete)
+Status: In progress (oracle + scaffold complete; slot-address write routing now implemented in mainline)
 
 ## Working mode
 - Pace: deliberate, step-by-step

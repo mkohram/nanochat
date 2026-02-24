@@ -28,10 +28,11 @@ class GDHOracleParams:
     W_mlp_in: torch.Tensor            # [D, D]
     W_mlp_out: torch.Tensor           # [D, D]
 
-    # Write
-    W_k_write: torch.Tensor           # [D, D] (projects sidecar state to slot keys)
-    W_v_write: torch.Tensor           # [D, D] (projects local token output to write values)
-    W_q_write_global: torch.Tensor    # [D, D] (projects local token output to write queries)
+    # Write (slot-address routing)
+    E_slots: torch.Tensor             # [R, D] permanent learnable slot addresses
+    W_q_slots_global: torch.Tensor    # [D, D] projects slot addresses into write queries
+    W_k_write: torch.Tensor           # [D, D] projects local token output into write keys
+    W_v_write: torch.Tensor           # [D, D] projects local token output into write values
     W_o_write: torch.Tensor           # [D, D]
 
 
@@ -51,7 +52,7 @@ def make_oracle_params(
     zero_init_mixers: bool = False,
 ) -> GDHOracleParams:
     """Create deterministic tiny parameters for oracle tests."""
-    del r, n_slots  # reserved for future decomposition / explicit slot-table variants
+    del r
 
     torch.manual_seed(seed)
 
@@ -73,9 +74,10 @@ def make_oracle_params(
         W_self_o=rand(d, d),
         W_mlp_in=rand(d, d),
         W_mlp_out=rand(d, d),
+        E_slots=rand(n_slots, d),
+        W_q_slots_global=rand(d, d),
         W_k_write=rand(d, d),
         W_v_write=rand(d, d),
-        W_q_write_global=rand(d, d),
         W_o_write=W_o_write,
     )
 
@@ -170,23 +172,23 @@ def gdh_oracle_layer(
             L_out[b, t] = l_out_t
 
             # ---------------------
-            # Phase III: Write (token -> sidecar cross-attention)
+            # Phase III: Write (slot-address routing)
             # ---------------------
             x_write = _rms_norm(l_out_t, eps=eps)                 # [D]
-            q_upd = x_write @ params.W_q_write_global             # [D]
+            k_upd = x_write @ params.W_k_write                    # [D]
             v_upd = x_write @ params.W_v_write                    # [D]
 
-            s_write = _rms_norm(s_t_prev, eps=eps)                # [R, D]
-            k_slots = s_write @ params.W_k_write                  # [R, D]
+            e_slots = _rms_norm(params.E_slots, eps=eps)          # [R, D]
+            q_slots = e_slots @ params.W_q_slots_global           # [R, D]
 
-            q_h = q_upd.view(n_write_heads, d_h)                  # [h, d_h]
+            q_h = q_slots.view(R, n_write_heads, d_h)             # [R, h, d_h]
+            k_h = k_upd.view(n_write_heads, d_h)                  # [h, d_h]
             v_h = v_upd.view(n_write_heads, d_h)                  # [h, d_h]
-            k_slots_h = k_slots.view(R, n_write_heads, d_h)       # [R, h, d_h]
 
             delta_raw = torch.zeros(R, D, dtype=L_in.dtype, device=L_in.device)
             for j in range(n_write_heads):
-                k_slots_j = k_slots_h[:, j, :]                    # [R, d_h]
-                logits_w = (k_slots_j @ q_h[j]) / math.sqrt(d_h)  # [R]
+                q_slots_j = q_h[:, j, :]                          # [R, d_h]
+                logits_w = (q_slots_j @ k_h[j]) / math.sqrt(d_h)  # [R]
                 alpha_w = torch.softmax(logits_w, dim=0)          # [R]
                 delta_raw[:, j * d_h:(j + 1) * d_h] = alpha_w[:, None] * v_h[j][None, :]
 
@@ -235,8 +237,9 @@ class GDHDecomposedOracleParams:
     W_mlp_in: torch.Tensor            # [D, D]
     W_mlp_out: torch.Tensor           # [D, D]
 
-    # Write globals + mixer
-    W_q_write_global: torch.Tensor    # [D, D] (projects sidecar state to slot keys)
+    # Write globals + mixer (slot-address routing)
+    E_slots: torch.Tensor             # [R, D] permanent learnable slot addresses
+    W_q_slots_global: torch.Tensor    # [D, D] projects slot addresses into write queries
     W_o_write: torch.Tensor           # [D, D]
 
 
@@ -262,7 +265,7 @@ def make_decomposed_oracle_params(
     zero_init_mixers: bool = False,
 ) -> GDHDecomposedOracleParams:
     """Create deterministic params for decomposed oracle tests."""
-    del h, n_slots  # reserved for future multi-head / explicit slot-table variants
+    del h
 
     torch.manual_seed(seed)
 
@@ -290,7 +293,8 @@ def make_decomposed_oracle_params(
         W_self_o=rand(d, d),
         W_mlp_in=rand(d, d),
         W_mlp_out=rand(d, d),
-        W_q_write_global=rand(d, d),
+        E_slots=rand(n_slots, d),
+        W_q_slots_global=rand(d, d),
         W_o_write=W_o_write,
     )
 
@@ -412,26 +416,25 @@ def gdh_oracle_layer_decomposed(
             l_out_hist.append(l_out_t)
 
             # ---------------------
-            # Phase III: Write (decomposed token -> sidecar cross-attention)
+            # Phase III: Write (decomposed token -> slot-address routing)
             # ---------------------
             out_hist = _rms_norm(torch.stack(l_out_hist, dim=0), eps=eps)   # [t+1,D]
-            x_write_q = M_k[t, :t + 1] @ out_hist                            # [D]
+            x_write_k = M_k[t, :t + 1] @ out_hist                            # [D]
             x_write_v = M_v[t, :t + 1] @ out_hist                            # [D]
 
-            q_upd = x_write_q @ params.W_q_write_global                      # [D]
+            e_slots = _rms_norm(params.E_slots, eps=eps)                     # [R,D]
+            q_slots = e_slots @ params.W_q_slots_global                       # [R,D]
+            k_upd = x_write_k @ params.W_k_write_short                       # [D]
             v_upd = x_write_v @ params.W_v_write_short                       # [D]
 
-            s_write = _rms_norm(s_t_prev, eps=eps)                           # [R,D]
-            k_slots = s_write @ params.W_k_write_short                       # [R,D]
-
-            q_h = q_upd.view(n_write_heads, d_h)
+            q_h = q_slots.view(R, n_write_heads, d_h)
+            k_h = k_upd.view(n_write_heads, d_h)
             v_h = v_upd.view(n_write_heads, d_h)
-            k_slots_h = k_slots.view(R, n_write_heads, d_h)
 
             delta_raw = torch.zeros(R, D, dtype=L_in.dtype, device=L_in.device)
             for j in range(n_write_heads):
-                k_slots_j = k_slots_h[:, j, :]                               # [R,d_h]
-                logits_w = (k_slots_j @ q_h[j]) / math.sqrt(d_h)             # [R]
+                q_slots_j = q_h[:, j, :]                                     # [R,d_h]
+                logits_w = (q_slots_j @ k_h[j]) / math.sqrt(d_h)             # [R]
                 alpha_w = torch.softmax(logits_w, dim=0)                     # [R]
                 delta_raw[:, j * d_h:(j + 1) * d_h] = alpha_w[:, None] * v_h[j][None, :]
 

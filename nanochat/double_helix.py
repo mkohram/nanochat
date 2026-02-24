@@ -28,6 +28,9 @@ class GDHConfig:
     - n_embd: model width D
     - n_slots: sidecar slot count R
     - n_write_heads: write head count h
+    - use_read_gate: if False, disable read gating (always-on sidecar read path)
+    - use_write_brain: if True, apply write-space MLP residual (Linear->ReLU²->Linear)
+    - write_brain_hidden_mult: hidden width multiplier for write brain (hidden = mult * D)
     - lora_rank: reserved for upcoming decomposed path
     - eps: RMSNorm epsilon
     """
@@ -35,6 +38,9 @@ class GDHConfig:
     n_embd: int
     n_slots: int
     n_write_heads: int
+    use_read_gate: bool = True
+    use_write_brain: bool = False
+    write_brain_hidden_mult: int = 4
     lora_rank: int = 8
     eps: float = 1e-6
 
@@ -47,6 +53,8 @@ class GDHConfig:
             raise ValueError("n_write_heads must be > 0")
         if self.n_embd % self.n_write_heads != 0:
             raise ValueError("n_embd must be divisible by n_write_heads")
+        if self.write_brain_hidden_mult <= 0:
+            raise ValueError("write_brain_hidden_mult must be > 0")
         if self.lora_rank <= 0:
             raise ValueError("lora_rank must be > 0")
         if self.eps <= 0:
@@ -67,6 +75,27 @@ class GDHTensorContract:
 
 def _rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+def _cosine_logit(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Cosine-style projection logit with controlled scale.
+
+    x: [..., D], w: [D, 1] -> output [...]
+    """
+    x_unit = x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+    w_col = w.squeeze(-1)
+    w_unit = w_col / w_col.norm().clamp_min(eps)
+    return torch.einsum("...d,d->...", x_unit, w_unit)
+
+
+def _cosine_similarity(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Cosine similarity for two tensors with shared trailing dim D.
+
+    x, y: [..., D] -> output [...]
+    """
+    x_unit = x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+    y_unit = y / y.norm(dim=-1, keepdim=True).clamp_min(eps)
+    return (x_unit * y_unit).sum(dim=-1)
 
 
 def validate_gdh_inputs(
@@ -104,19 +133,53 @@ def validate_gdh_inputs(
 class GDHReadCore(nn.Module):
     """Read phase core: sidecar -> local."""
 
-    def __init__(self, d: int):
+    def __init__(self, d: int, *, use_read_gate: bool = True):
         super().__init__()
+        self.use_read_gate = use_read_gate
         self.W_q_read = nn.Parameter(torch.empty(d, d))
         self.W_k_read_global = nn.Parameter(torch.empty(d, d))
         self.W_v_read_global = nn.Parameter(torch.empty(d, d))
         self.W_o_read = nn.Parameter(torch.empty(d, d))
         self.W_g_read = nn.Parameter(torch.empty(d, 1))
+        # Competing sidecar logit for a 2-way softmax gate (local vs sidecar).
+        self.W_g_side = nn.Parameter(torch.empty(d, 1))
+        # Content-aware tie-breaker: lets gate credit assignment depend on
+        # query/read alignment, not only a local-token probe.
+        self.w_g_interaction = nn.Parameter(torch.zeros(1))
+        # Read-attention confidence scalar (low entropy => more confident retrieval).
+        self.w_g_confidence = nn.Parameter(torch.zeros(1))
+        # Novelty scalar: rewards non-redundant sidecar content vs local state.
+        self.w_g_novelty = nn.Parameter(torch.zeros(1))
+        # Confidence-conditioned gate temperature (zero-init => temperature 1).
+        self.w_g_temp = nn.Parameter(torch.zeros(1))
+        # Query-advantage-conditioned temperature: sharpen competition when
+        # sidecar has clear incremental read-intent edge over local state.
+        self.w_g_temp_adv = nn.Parameter(torch.zeros(1))
+        # Synergy term: high confidence + high novelty gets extra sidecar credit.
+        self.w_g_synergy = nn.Parameter(torch.zeros(1))
+        # Query-match term: rewards reads aligned with the learned read query.
+        self.w_g_querymatch = nn.Parameter(torch.zeros(1))
+        # Query-advantage term: favors sidecar when it matches read intent
+        # better than the current local state does.
+        self.w_g_queryadv = nn.Parameter(torch.zeros(1))
+        # Signed quadratic query-advantage term: increases routing pressure when
+        # sidecar/local intent advantage is decisively non-zero.
+        self.w_g_queryadv2 = nn.Parameter(torch.zeros(1))
+        # Deprecated experimental terms kept for checkpoint/test compatibility.
+        # Intentionally not used in current read-gate logic.
+        self.w_g_advnovel = nn.Parameter(torch.zeros(1))
+        self.w_g_advconf = nn.Parameter(torch.zeros(1))
+        self.w_g_queryresid = nn.Parameter(torch.zeros(1))
+        self.w_g_advconfnovel = nn.Parameter(torch.zeros(1))
+        self.w_g_localquery = nn.Parameter(torch.zeros(1))
+        self.w_g_localredundancy = nn.Parameter(torch.zeros(1))
 
     def reset_parameters(self, *, std: float, zero_init_mixer: bool) -> None:
         nn.init.normal_(self.W_q_read, mean=0.0, std=std)
         nn.init.normal_(self.W_k_read_global, mean=0.0, std=std)
         nn.init.normal_(self.W_v_read_global, mean=0.0, std=std)
         nn.init.normal_(self.W_g_read, mean=0.0, std=std)
+        nn.init.zeros_(self.W_g_side)
         if zero_init_mixer:
             nn.init.zeros_(self.W_o_read)
         else:
@@ -135,7 +198,40 @@ class GDHReadCore(nn.Module):
         alpha_read = torch.softmax(logits_read, dim=0)
         z_read = alpha_read @ v_mem
 
-        g_read = torch.sigmoid((x_read @ self.W_g_read).squeeze(-1))
+        if not self.use_read_gate:
+            return l_t + (z_read @ self.W_o_read)
+
+        interaction = _cosine_similarity(x_read, z_read, eps=eps)
+        query_match = _cosine_similarity(q_loc, z_read, eps=eps)
+        local_query_match = _cosine_similarity(q_loc, x_read, eps=eps)
+        query_advantage = query_match - local_query_match
+        query_advantage_signed_sq = query_advantage * query_advantage.abs()
+        entropy = -(alpha_read * torch.log(alpha_read.clamp_min(1e-9))).sum()
+        confidence = 1.0 - (entropy / math.log(max(alpha_read.shape[0], 2)))
+        confidence_centered = confidence - 0.5
+        novelty_centered = (1.0 - interaction.pow(2)) - 0.5
+
+        local_logit = (x_read @ self.W_g_read).squeeze(-1)
+        synergy = confidence_centered * novelty_centered
+        side_logit = (
+            _cosine_logit(z_read, self.W_g_side, eps=eps)
+            + self.w_g_interaction.squeeze(0) * interaction
+            + self.w_g_confidence.squeeze(0) * confidence_centered
+            + self.w_g_novelty.squeeze(0) * novelty_centered
+            + self.w_g_synergy.squeeze(0) * synergy
+            + self.w_g_querymatch.squeeze(0) * query_match
+            + self.w_g_queryadv.squeeze(0) * query_advantage
+            + self.w_g_queryadv2.squeeze(0) * query_advantage_signed_sq
+        )
+        gate_logits = torch.stack([local_logit, side_logit], dim=0)
+        # Adaptive competition temperature: diffuse retrieval -> flatter competition,
+        # confident retrieval -> sharper routing decision.
+        adv_temp_signal = torch.tanh(query_advantage).clamp_min(0.0)
+        temperature = torch.exp(
+            -self.w_g_temp.squeeze(0) * confidence_centered
+            -self.w_g_temp_adv.squeeze(0) * adv_temp_signal
+        )
+        g_read = torch.softmax(gate_logits / temperature, dim=0)[1]
         return l_t + g_read * (z_read @ self.W_o_read)
 
     def forward_sequence(self, local: torch.Tensor, sidecar_prev: torch.Tensor, *, eps: float) -> torch.Tensor:
@@ -154,8 +250,40 @@ class GDHReadCore(nn.Module):
         alpha = torch.softmax(logits, dim=-1)                                     # [B,N,R]
         z_read = torch.einsum("bnr,bnrd->bnd", alpha, v_mem)                     # [B,N,D]
 
-        g_read = torch.sigmoid(torch.matmul(x_read, self.W_g_read))               # [B,N,1]
-        return local + g_read * torch.matmul(z_read, self.W_o_read)               # [B,N,D]
+        if not self.use_read_gate:
+            return local + torch.matmul(z_read, self.W_o_read)                    # [B,N,D]
+
+        interaction = _cosine_similarity(x_read, z_read, eps=eps)                    # [B,N]
+        query_match = _cosine_similarity(q_loc, z_read, eps=eps)                     # [B,N]
+        local_query_match = _cosine_similarity(q_loc, x_read, eps=eps)               # [B,N]
+        query_advantage = query_match - local_query_match                             # [B,N]
+        query_advantage_signed_sq = query_advantage * query_advantage.abs()           # [B,N]
+        entropy = -(alpha * torch.log(alpha.clamp_min(1e-9))).sum(dim=-1)            # [B,N]
+        confidence = 1.0 - (entropy / math.log(max(sidecar_prev.shape[2], 2)))        # [B,N]
+        confidence_centered = confidence - 0.5                                         # [B,N]
+        novelty_centered = (1.0 - interaction.pow(2)) - 0.5                           # [B,N]
+        local_logit = torch.matmul(x_read, self.W_g_read).squeeze(-1)                 # [B,N]
+        synergy = confidence_centered * novelty_centered
+        side_logit = (
+            _cosine_logit(z_read, self.W_g_side, eps=eps)
+            + self.w_g_interaction * interaction
+            + self.w_g_confidence * confidence_centered
+            + self.w_g_novelty * novelty_centered
+            + self.w_g_synergy * synergy
+            + self.w_g_querymatch * query_match
+            + self.w_g_queryadv * query_advantage
+            + self.w_g_queryadv2 * query_advantage_signed_sq
+        )
+        gate_logits = torch.stack([local_logit, side_logit], dim=-1)                 # [B,N,2]
+        # Adaptive competition temperature: diffuse retrieval -> flatter competition,
+        # confident retrieval -> sharper routing decision.
+        adv_temp_signal = torch.tanh(query_advantage).clamp_min(0.0)                    # [B,N]
+        temperature = torch.exp(
+            -self.w_g_temp * confidence_centered
+            -self.w_g_temp_adv * adv_temp_signal
+        ).unsqueeze(-1)                                                                  # [B,N,1]
+        g_read = torch.softmax(gate_logits / temperature, dim=-1)[..., 1:2]          # [B,N,1]
+        return local + g_read * torch.matmul(z_read, self.W_o_read)                 # [B,N,D]
 
 
 class GDHProcessCore(nn.Module):
@@ -198,26 +326,108 @@ class GDHProcessCore(nn.Module):
 
 
 class GDHWriteCore(nn.Module):
-    """Write phase core: local -> sidecar delta via token-to-sidecar cross-attention."""
+    """Write phase core using learnable slot addresses (E_slots).
 
-    def __init__(self, d: int, r: int | None = None):
+    Routing design:
+    - static slot queries (global):  Q_slots = RMSNorm(E_slots) @ W_q_slots_global
+    - token-conditioned keys/values (layer-local):
+        K_upd = x_write @ W_k_write
+        V_upd = x_write @ W_v_write
+    - slot routing weights come from softmax(Q_slots · K_upd)
+
+    Optional write-brain:
+    - Applies sidecar-space residual MLP on write deltas:
+      delta = delta + MLP(RMSNorm(delta)), where MLP is Linear->ReLU²->Linear.
+    """
+
+    def __init__(
+        self,
+        d: int,
+        r: int | None = None,
+        *,
+        use_write_brain: bool = False,
+        write_brain_hidden_mult: int = 4,
+    ):
         super().__init__()
-        del r  # slot count is carried by sidecar tensor shape, not a learned slot table
-        # Query/Value come from token-local output.
-        self.W_q_write_global = nn.Parameter(torch.empty(d, d))
-        self.W_v_write = nn.Parameter(torch.empty(d, d))
-        # Keys come from current sidecar state.
+        if r is None or r <= 0:
+            raise ValueError("GDHWriteCore requires positive slot count r")
+
+        # Global slot-address parameters (tied across layers at GPT level).
+        self.E_slots = nn.Parameter(torch.empty(r, d))
+        self.W_q_slots_global = nn.Parameter(torch.empty(d, d))
+
+        # Layer-local token translators + output mixer.
         self.W_k_write = nn.Parameter(torch.empty(d, d))
+        self.W_v_write = nn.Parameter(torch.empty(d, d))
         self.W_o_write = nn.Parameter(torch.empty(d, d))
 
+        self.use_write_brain = use_write_brain
+        self.write_brain_hidden_mult = write_brain_hidden_mult
+        if use_write_brain:
+            hidden = write_brain_hidden_mult * d
+            self.W_write_mlp_in_global = nn.Parameter(torch.empty(d, hidden))
+            self.W_write_mlp_out_global = nn.Parameter(torch.empty(hidden, d))
+        else:
+            self.register_parameter("W_write_mlp_in_global", None)
+            self.register_parameter("W_write_mlp_out_global", None)
+
+    @property
+    def W_q_write_global(self) -> nn.Parameter:
+        """Legacy alias for backward compatibility; use W_q_slots_global."""
+        return self.W_q_slots_global
+
+    @W_q_write_global.setter
+    def W_q_write_global(self, value: nn.Parameter) -> None:
+        self.W_q_slots_global = value
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Backward-compat for checkpoints saved before naming cleanup.
+        legacy_key = prefix + "W_q_write_global"
+        new_key = prefix + "W_q_slots_global"
+        if legacy_key in state_dict and new_key not in state_dict:
+            state_dict[new_key] = state_dict.pop(legacy_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def reset_parameters(self, *, std: float, zero_init_mixer: bool) -> None:
-        nn.init.normal_(self.W_q_write_global, mean=0.0, std=std)
-        nn.init.normal_(self.W_v_write, mean=0.0, std=std)
+        # Slot identity anchors: keep a clear non-degenerate initialization.
+        nn.init.normal_(self.E_slots, mean=0.0, std=1.0)
+        nn.init.normal_(self.W_q_slots_global, mean=0.0, std=std)
+
         nn.init.normal_(self.W_k_write, mean=0.0, std=std)
+        nn.init.normal_(self.W_v_write, mean=0.0, std=std)
         if zero_init_mixer:
             nn.init.zeros_(self.W_o_write)
         else:
             nn.init.normal_(self.W_o_write, mean=0.0, std=std)
+
+        if self.use_write_brain and self.W_write_mlp_in_global is not None:
+            nn.init.normal_(self.W_write_mlp_in_global, mean=0.0, std=std)
+            # Safe bootstrap: keep write-brain residual near-zero at init.
+            nn.init.zeros_(self.W_write_mlp_out_global)
+
+    def _apply_write_brain(self, delta: torch.Tensor, *, eps: float) -> torch.Tensor:
+        if not self.use_write_brain or self.W_write_mlp_in_global is None:
+            return delta
+        delta_norm = _rms_norm(delta, eps=eps)
+        hidden = torch.relu(torch.matmul(delta_norm, self.W_write_mlp_in_global)).square()
+        return delta + torch.matmul(hidden, self.W_write_mlp_out_global)
 
     def forward_step(
         self,
@@ -229,27 +439,29 @@ class GDHWriteCore(nn.Module):
     ) -> torch.Tensor:
         d = l_out_t.shape[-1]
         r = s_t_prev.shape[0]
+        assert self.E_slots.shape[0] == r, "sidecar slot count must match E_slots"
         d_h = d // n_write_heads
 
         x_write = _rms_norm(l_out_t, eps=eps)
-        q_upd = x_write @ self.W_q_write_global
+        k_upd = x_write @ self.W_k_write
         v_upd = x_write @ self.W_v_write
 
-        s_hat = _rms_norm(s_t_prev, eps=eps)
-        k_slots = s_hat @ self.W_k_write
+        e_slots = _rms_norm(self.E_slots, eps=eps)
+        q_slots = e_slots @ self.W_q_slots_global
 
-        q_h = q_upd.view(n_write_heads, d_h)
-        v_h = v_upd.view(n_write_heads, d_h)
-        k_slots_h = k_slots.view(r, n_write_heads, d_h)
+        q_h = q_slots.view(r, n_write_heads, d_h)   # [R,h,d_h]
+        k_h = k_upd.view(n_write_heads, d_h)        # [h,d_h]
+        v_h = v_upd.view(n_write_heads, d_h)        # [h,d_h]
 
         delta_raw = torch.zeros(r, d, dtype=l_out_t.dtype, device=l_out_t.device)
         for j in range(n_write_heads):
-            k_slots_j = k_slots_h[:, j, :]
-            logits_w = (k_slots_j @ q_h[j]) / math.sqrt(d_h)
-            alpha_w = torch.softmax(logits_w, dim=0)
+            q_slots_j = q_h[:, j, :]                                # [R,d_h]
+            logits_w = (q_slots_j @ k_h[j]) / math.sqrt(d_h)        # [R]
+            alpha_w = torch.softmax(logits_w, dim=0)                # [R]
             delta_raw[:, j * d_h:(j + 1) * d_h] = alpha_w[:, None] * v_h[j][None, :]
 
-        return delta_raw @ self.W_o_write
+        delta = delta_raw @ self.W_o_write
+        return self._apply_write_brain(delta, eps=eps)
 
     def forward_sequence_delta(
         self,
@@ -263,27 +475,28 @@ class GDHWriteCore(nn.Module):
         bsz, n_tokens, d = local_out.shape
         assert d % n_write_heads == 0
         assert sidecar_prev.shape[:2] == (bsz, n_tokens)
+        r = sidecar_prev.shape[2]
+        assert self.E_slots.shape[0] == r, "sidecar slot count must match E_slots"
         d_h = d // n_write_heads
 
-        x_write = _rms_norm(local_out, eps=eps)                                     # [B,N,D]
-        q_upd = torch.matmul(x_write, self.W_q_write_global)                        # [B,N,D]
-        v_upd = torch.matmul(x_write, self.W_v_write)                               # [B,N,D]
+        x_write = _rms_norm(local_out, eps=eps)                                 # [B,N,D]
+        k_upd = torch.matmul(x_write, self.W_k_write)                           # [B,N,D]
+        v_upd = torch.matmul(x_write, self.W_v_write)                           # [B,N,D]
 
-        s_hat = _rms_norm(sidecar_prev, eps=eps)                                    # [B,N,R,D]
-        k_slots = torch.einsum("bnrd,df->bnrf", s_hat, self.W_k_write)            # [B,N,R,D]
+        e_slots = _rms_norm(self.E_slots, eps=eps)                              # [R,D]
+        q_slots = torch.matmul(e_slots, self.W_q_slots_global)                   # [R,D]
+        q_slots_h = q_slots.view(r, n_write_heads, d_h)                         # [R,h,d_h]
 
-        q_h = q_upd.view(bsz, n_tokens, n_write_heads, d_h)                         # [B,N,h,d_h]
-        v_h = v_upd.view(bsz, n_tokens, n_write_heads, d_h)                         # [B,N,h,d_h]
-        r = k_slots.shape[2]
-        k_slots_h = k_slots.view(bsz, n_tokens, r, n_write_heads, d_h)              # [B,N,R,h,d_h]
+        k_h = k_upd.view(bsz, n_tokens, n_write_heads, d_h)                     # [B,N,h,d_h]
+        v_h = v_upd.view(bsz, n_tokens, n_write_heads, d_h)                     # [B,N,h,d_h]
 
-        logits = torch.einsum("bnrhd,bnhd->bnhr", k_slots_h, q_h) / math.sqrt(d_h)  # [B,N,h,R]
-        alpha = torch.softmax(logits, dim=-1)                                       # [B,N,h,R]
-        delta_heads = torch.einsum("bnhr,bnhd->bnhrd", alpha, v_h)                 # [B,N,h,R,d_h]
+        logits = torch.einsum("rhd,bnhd->bnhr", q_slots_h, k_h) / math.sqrt(d_h)   # [B,N,h,R]
+        alpha = torch.softmax(logits, dim=-1)                                         # [B,N,h,R]
+        delta_heads = torch.einsum("bnhr,bnhd->bnhrd", alpha, v_h)                   # [B,N,h,R,d_h]
 
         delta_raw = delta_heads.permute(0, 1, 3, 2, 4).contiguous().view(bsz, n_tokens, r, d)
         delta = torch.einsum("bnrd,df->bnrf", delta_raw, self.W_o_write)
-        return delta
+        return self._apply_write_brain(delta, eps=eps)
 
 
 class GDHLayer(nn.Module):
@@ -308,9 +521,14 @@ class GDHLayer(nn.Module):
         d = config.n_embd
         r = config.n_slots
 
-        self.read = GDHReadCore(d)
+        self.read = GDHReadCore(d, use_read_gate=config.use_read_gate)
         self.process = GDHProcessCore(d)
-        self.write = GDHWriteCore(d, r)
+        self.write = GDHWriteCore(
+            d,
+            r,
+            use_write_brain=config.use_write_brain,
+            write_brain_hidden_mult=config.write_brain_hidden_mult,
+        )
 
         self.reset_parameters(zero_init_mixers=zero_init_mixers)
 

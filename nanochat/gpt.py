@@ -43,6 +43,9 @@ class GPTConfig:
     # GDH knobs (used when arch == "gdh")
     gdh_slots: int = 16
     gdh_write_heads: int = -1  # -1 means use n_head
+    gdh_use_read_gate: bool = True
+    gdh_use_write_brain: bool = True
+    gdh_write_brain_hidden_mult: int = 4
 
 
 def norm(x):
@@ -186,8 +189,19 @@ class GPT(nn.Module):
         if self.arch not in {"baseline", "gdh"}:
             raise ValueError(f"Unknown arch: {config.arch}. Use baseline or gdh.")
         if self.arch == "gdh":
-            self.gdh_read = nn.ModuleList([GDHReadCore(config.n_embd) for _ in range(config.n_layer)])
-            self.gdh_write = nn.ModuleList([GDHWriteCore(config.n_embd, config.gdh_slots) for _ in range(config.n_layer)])
+            self.gdh_read = nn.ModuleList([
+                GDHReadCore(config.n_embd, use_read_gate=config.gdh_use_read_gate)
+                for _ in range(config.n_layer)
+            ])
+            self.gdh_write = nn.ModuleList([
+                GDHWriteCore(
+                    config.n_embd,
+                    config.gdh_slots,
+                    use_write_brain=config.gdh_use_write_brain,
+                    write_brain_hidden_mult=config.gdh_write_brain_hidden_mult,
+                )
+                for _ in range(config.n_layer)
+            ])
 
             # Tie the designated global GDH weights across layers.
             self._tie_gdh_global_weights()
@@ -213,6 +227,10 @@ class GPT(nn.Module):
     def _tie_gdh_global_weights(self):
         """Tie designated GDH global weights across layers.
 
+        Design intent:
+        - local-token translators stay layer-specific
+        - shared sidecar-space / slot-address translators stay global
+
         Note: model.to_empty can break shared Parameter references, so we call this
         in init_weights as well to re-establish ties before initialization.
         """
@@ -222,13 +240,22 @@ class GPT(nn.Module):
         # Use layer-0 tensors as canonical shared parameters.
         shared_k_read = self.gdh_read[0].W_k_read_global
         shared_v_read = self.gdh_read[0].W_v_read_global
-        shared_q_write = self.gdh_write[0].W_q_write_global
+
+        shared_e_slots = self.gdh_write[0].E_slots
+        shared_q_slots = self.gdh_write[0].W_q_slots_global
+
+        shared_write_mlp_in = self.gdh_write[0].W_write_mlp_in_global
+        shared_write_mlp_out = self.gdh_write[0].W_write_mlp_out_global
 
         for read_core in self.gdh_read[1:]:
             read_core.W_k_read_global = shared_k_read
             read_core.W_v_read_global = shared_v_read
         for write_core in self.gdh_write[1:]:
-            write_core.W_q_write_global = shared_q_write
+            write_core.E_slots = shared_e_slots
+            write_core.W_q_slots_global = shared_q_slots
+            if shared_write_mlp_in is not None:
+                write_core.W_write_mlp_in_global = shared_write_mlp_in
+                write_core.W_write_mlp_out_global = shared_write_mlp_out
 
     @torch.no_grad()
     def init_weights(self):

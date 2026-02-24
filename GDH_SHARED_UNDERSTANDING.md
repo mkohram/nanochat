@@ -1,6 +1,6 @@
 # GDH Shared Understanding (Implementation Notes)
 
-Date: 2026-02-18
+Date: 2026-02-18 (updated 2026-02-23)
 
 This file captures the *intent* behind GDH so implementation stays aligned even if formal math is revised.
 
@@ -60,8 +60,56 @@ This file captures the *intent* behind GDH so implementation stays aligned even 
 
 ## Decomposed-oracle variant (added)
 
-- Added a second slow oracle (`tests/gdh/oracle_decomposed.py`) with **shared context-side decomposition**.
+- Added a second slow oracle path in `tests/gdh/oracle.py` with **shared context-side decomposition**.
 - One shared long/context factor `U_ctx_shared` is used across Q_read / K_write / V_write translator paths.
 - Translator-specific short/context factors (`V_ctx_*`) define per-path behavior.
 - Causal sequence mixers are built as masked row-softmax of `U_ctx_shared @ V_ctx_*`.
 - This keeps the implementation explicit and testable while reflecting the "share long (context) side" design intent.
+
+## Current mainline implementation snapshot (2026-02-23)
+
+- Write routing in `nanochat/double_helix.py` uses **learnable slot addresses**:
+  - `Q_slots = RMSNorm(E_slots) @ W_q_slots_global` (global/shared)
+  - `K_upd = x_write @ W_k_write`, `V_upd = x_write @ W_v_write` (layer-local)
+- Read phase still attends to accumulated sidecar state (`S`) via global read K/V.
+- Mainline temporal integration in `nanochat/gpt.py` is currently pure additive scan:
+  - `sidecar = sidecar + torch.cumsum(delta, dim=1)` (equivalent to `beta=1.0`)
+- Boundary-reset behavior is still an intent/contract item; it is not currently enforced inside the mainline GPT GDH forward path.
+- Layer-sharing policy in `nanochat/gpt.py`:
+  - shared across layers: `W_k_read_global`, `W_v_read_global`, `E_slots`, `W_q_slots_global`
+  - layer-local: `W_k_write`, `W_v_write`, `W_o_write`, read-local params
+- Canonical naming cleanup:
+  - use `W_q_slots_global` (not `W_q_write_global`) for the global slot-query projection.
+  - `GDHWriteCore` keeps a legacy alias/loading shim so older checkpoints still restore.
+- Telemetry in `scripts/local_base_train.py` now logs global write-routing diagnostics for `E_slots` and `W_q_slots_global` (including tie checks across layers).
+
+## MQAR probe-only extensions (current testbed)
+
+These are active in `experiments/mqar_scan_beta_probe.py` for Stage-1 blindfold experiments, but are **not** part of the canonical GDH spec yet.
+
+- **Sparse routing (`route_topk`)**
+  - Applied post-softmax on slot routing weights, then renormalized.
+  - Used to reduce effective write density and slot collisions.
+
+- **Usage balancing loss (`usage_balance_lambda`)**
+  - Layer-local auxiliary loss encouraging uniform slot usage.
+  - Implemented on `alpha_soft` (pre-topk hard mask), with gate-aware weighting.
+
+- **Ad-hoc write gate injection (`g_write`) in `_build_model`**
+  - Probe injects per-layer scalar gate modules (`Linear(D->1)`) as `model.g_write_projs`.
+  - Bias initialized negative (e.g. `-2.0`) so writes start mostly closed.
+  - Final write delta is multiplied by `sigmoid(g_write)`.
+  - Same gate weighting is used in usage-balancing aggregation so low-gate/noisy tokens contribute less to slot-usage pressure.
+
+## Future ideas backlog (not implemented yet)
+
+- **Sidecar transition auxiliary loss** (self-supervised sidecar objective):
+  - Let current sidecar state predict the **next write delta** (`Δ_{t+1}`), instead of only relying on token CE loss.
+  - Preference: predict next-**delta** rather than next-state (`S_{t+1}`), because next-state can become an identity shortcut (`S_{t+1}=S_t+Δ_{t+1}`).
+  - Candidate form:
+    - predictor input: `RMSNorm(S_t)`
+    - predictor output: `\hat{Δ}_{t+1}`
+    - target: `stopgrad(RMSNorm(Δ_{t+1}))`
+    - loss: cosine/Huber
+  - Integrate as small weighted auxiliary term: `L = L_ce + λ * L_sidecar` (warm up `λ` conservatively).
+  - Start with a **global/shared predictor** in sidecar space for symmetry with shared sidecar transforms.
