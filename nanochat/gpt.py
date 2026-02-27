@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -38,6 +39,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Optional blindfold override: if >0, force this fixed SWA window on ALL layers
+    # (including final layer).
+    force_swa_window: int = 0
     # Architecture selection
     arch: str = "baseline"  # baseline|gdh
     # GDH knobs (used when arch == "gdh")
@@ -46,6 +50,19 @@ class GPTConfig:
     gdh_use_read_gate: bool = True
     gdh_use_write_brain: bool = True
     gdh_write_brain_hidden_mult: int = 4
+    # Probe-parity knobs (default off/no-op to preserve prior behavior)
+    gdh_route_topk: int = 0
+    gdh_scan_beta: float = 1.0
+    gdh_use_ema_scan: bool = False
+    gdh_usage_balance_lambda: float = 0.0
+    gdh_use_write_gate: bool = False
+    gdh_write_gate_bias: float = -2.0
+    gdh_probe_warmstart_read_mixer: bool = False
+    # BOS-aware sidecar hygiene
+    gdh_segmented_scan: bool = True
+    gdh_bos_token_id: int = 1
+    # Value embeddings toggle (ResFormer-style value residual path)
+    use_value_embeds: bool = True
 
 
 def norm(x):
@@ -53,8 +70,10 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):
+def has_ve(layer_idx, n_layer, use_value_embeds=True):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+    if not use_value_embeds:
+        return False
     return layer_idx % 2 == (n_layer - 1) % 2
 
 def apply_rotary_emb(x, cos, sin):
@@ -80,7 +99,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer, config.use_value_embeds) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -183,7 +202,7 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer, config.use_value_embeds)})
         # Optional GDH wrappers around the standard block process path
         self.arch = config.arch.lower()
         if self.arch not in {"baseline", "gdh"}:
@@ -202,6 +221,9 @@ class GPT(nn.Module):
                 )
                 for _ in range(config.n_layer)
             ])
+            self.gdh_write_gate = nn.ModuleList([
+                nn.Linear(config.n_embd, 1, bias=True) for _ in range(config.n_layer)
+            ]) if config.gdh_use_write_gate else None
 
             # Tie the designated global GDH weights across layers.
             self._tie_gdh_global_weights()
@@ -214,6 +236,7 @@ class GPT(nn.Module):
         else:
             self.gdh_read = None
             self.gdh_write = None
+            self.gdh_write_gate = None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -315,6 +338,15 @@ class GPT(nn.Module):
                 read_core.reset_parameters(std=gdh_std, zero_init_mixer=True)
                 write_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
 
+            if self.gdh_write_gate is not None:
+                for proj in self.gdh_write_gate:
+                    torch.nn.init.normal_(proj.weight, mean=0.0, std=0.02)
+                    torch.nn.init.constant_(proj.bias, self.config.gdh_write_gate_bias)
+
+            if self.config.gdh_probe_warmstart_read_mixer:
+                for i in range(min(2, len(self.gdh_read))):
+                    torch.nn.init.normal_(self.gdh_read[i].W_o_read, mean=0.0, std=0.02)
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -357,6 +389,9 @@ class GPT(nn.Module):
         Pattern string is tiled across layers. Final layer always gets L (full context).
         Characters: L=long (full context), S=short (half context)
         """
+        if getattr(config, "force_swa_window", 0) > 0:
+            return [(int(config.force_swa_window), 0)] * config.n_layer
+
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes
@@ -424,7 +459,8 @@ class GPT(nn.Module):
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         gdh_matrices = 0 if self.arch != "gdh" else (
             sum(p.numel() for p in self.gdh_read.parameters()) +
-            sum(p.numel() for p in self.gdh_write.parameters())
+            sum(p.numel() for p in self.gdh_write.parameters()) +
+            (0 if self.gdh_write_gate is None else sum(p.numel() for p in self.gdh_write_gate.parameters()))
         )
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + gdh_matrices + scalars
@@ -446,14 +482,30 @@ class GPT(nn.Module):
         # Separate out all parameters into groups
         transformer_matrix_params = list(self.transformer.h.parameters())
         gdh_matrix_params = []
+        gdh_global_params = []
         if self.arch == "gdh":
-            gdh_matrix_params = list(self.gdh_read.parameters()) + list(self.gdh_write.parameters())
+            gdh_all_params = list(self.gdh_read.parameters()) + list(self.gdh_write.parameters())
+            # Tied/global GDH tensors can be high-leverage; train them with lower LR.
+            read0 = self.gdh_read[0]
+            write0 = self.gdh_write[0]
+            gdh_global_params = [
+                read0.W_k_read_global,
+                read0.W_v_read_global,
+                write0.E_slots,
+                write0.W_q_slots_global,
+            ]
+            if getattr(write0, "W_write_mlp_in_global", None) is not None:
+                gdh_global_params += [write0.W_write_mlp_in_global, write0.W_write_mlp_out_global]
+            global_ids = {id(p) for p in gdh_global_params}
+            gdh_matrix_params = [p for p in gdh_all_params if id(p) not in global_ids]
+            if self.gdh_write_gate is not None:
+                gdh_matrix_params += list(self.gdh_write_gate.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(transformer_matrix_params) + len(gdh_matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(transformer_matrix_params) + len(gdh_matrix_params) + len(gdh_global_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -470,6 +522,13 @@ class GPT(nn.Module):
         ]
 
         # GDH path is still early-stage; keep it on AdamW to avoid Muon instability on tiny shapes.
+        # Use lower LR for tied/global GDH tensors to reduce high-leverage state blow-ups.
+        gdh_global_lr_mult = 0.25
+        if gdh_global_params:
+            param_groups.append(dict(
+                kind='adamw', params=gdh_global_params, lr=matrix_lr * gdh_global_lr_mult,
+                betas=adam_betas, eps=1e-10, weight_decay=0.0,
+            ))
         if gdh_matrix_params:
             param_groups.append(dict(
                 kind='adamw', params=gdh_matrix_params, lr=matrix_lr,
@@ -490,7 +549,150 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _gdh_scan_accumulate_ema(self, delta, retention, boundary_mask=None):
+        """Vectorized segmented EMA scan.
+
+        Recurrence per token: S_t = g_t * S_{t-1} + (1 - g_t) * delta_t
+        where g_t in [0,1] (retention). With bounded delta, this is a convex update.
+        """
+        g = retention.clamp(1e-6, 1.0 - 1e-6).to(delta.dtype)
+        one_minus_g = (1.0 - g)
+        b = one_minus_g * delta
+
+        if boundary_mask is None:
+            logg = torch.log(g.to(torch.float64))
+            logp = torch.cumsum(logg, dim=1)
+            p = torch.exp(logp)
+            u = b.to(torch.float64) / p
+            y = p * torch.cumsum(u, dim=1)
+            return y.to(delta.dtype)
+
+        bmask = boundary_mask.to(torch.bool)
+        assert bmask.shape == delta.shape[:2], f"boundary_mask shape {bmask.shape} must match delta (B,T) {delta.shape[:2]}"
+
+        B, T = bmask.shape
+        t_idx = torch.arange(T, device=delta.device, dtype=torch.long).view(1, T).expand(B, T)
+        neg_inf = torch.full_like(t_idx, -10**9)
+        start_pos = torch.where(bmask, t_idx, neg_inf)
+        last_start, _ = torch.cummax(start_pos, dim=1)
+
+        def _subtract_segment_prefix(prefix_tensor):
+            prev_idx = (last_start - 1).clamp_min(0)
+            gather_idx = prev_idx.view(B, T, 1, 1).expand(B, T, prefix_tensor.size(2), prefix_tensor.size(3))
+            prefix_prev = torch.gather(prefix_tensor, dim=1, index=gather_idx)
+            has_prev = (last_start > 0).view(B, T, 1, 1)
+            return prefix_tensor - torch.where(has_prev, prefix_prev, torch.zeros_like(prefix_prev))
+
+        logg = torch.log(g.to(torch.float64))
+        logp_prefix = torch.cumsum(logg, dim=1)
+        logp_local = _subtract_segment_prefix(logp_prefix)
+        p_local = torch.exp(logp_local)
+
+        u = b.to(torch.float64) / p_local
+        u_prefix = torch.cumsum(u, dim=1)
+        u_local = _subtract_segment_prefix(u_prefix)
+        y = p_local * u_local
+        return y.to(delta.dtype)
+
+    def _gdh_scan_accumulate(self, delta, beta: float, boundary_mask=None):
+        if boundary_mask is None:
+            if beta >= 1.0:
+                return torch.cumsum(delta, dim=1)
+            if beta <= 0.0:
+                return delta
+
+            t = delta.shape[1]
+            beta_t = torch.tensor(float(beta), device=delta.device, dtype=torch.float64)
+            idx = torch.arange(t, device=delta.device, dtype=torch.float64)
+            beta_pow = torch.pow(beta_t, idx)
+            beta_inv = torch.pow(beta_t, -idx)
+            x = delta.to(torch.float64)
+            y = torch.cumsum(x * beta_inv.view(1, t, 1, 1), dim=1) * beta_pow.view(1, t, 1, 1)
+            return y.to(delta.dtype)
+
+        # Boundary-aware segmented scan: reset accumulator at segment starts (e.g., BOS positions).
+        # boundary_mask shape: (B, T), True means "start of new segment".
+        bmask = boundary_mask.to(torch.bool)
+        assert bmask.shape == delta.shape[:2], f"boundary_mask shape {bmask.shape} must match delta (B,T) {delta.shape[:2]}"
+
+        B, T = bmask.shape
+        t_idx = torch.arange(T, device=delta.device, dtype=torch.long).view(1, T).expand(B, T)
+        neg_inf = torch.full_like(t_idx, -10**9)
+        start_pos = torch.where(bmask, t_idx, neg_inf)
+        # last_start[b, t] = index of the most recent boundary <= t
+        last_start, _ = torch.cummax(start_pos, dim=1)
+
+        # segment-prefix subtraction helper: subtract prefix value at (segment_start - 1)
+        def _subtract_segment_prefix(prefix_tensor):
+            prev_idx = (last_start - 1).clamp_min(0)
+            gather_idx = prev_idx.view(B, T, 1, 1).expand(B, T, prefix_tensor.size(2), prefix_tensor.size(3))
+            prefix_prev = torch.gather(prefix_tensor, dim=1, index=gather_idx)
+            has_prev = (last_start > 0).view(B, T, 1, 1)
+            return prefix_tensor - torch.where(has_prev, prefix_prev, torch.zeros_like(prefix_prev))
+
+        if beta <= 0.0:
+            return delta
+
+        if beta >= 1.0:
+            # Segmented cumsum via global cumsum minus per-segment prefix baseline.
+            prefix = torch.cumsum(delta, dim=1)
+            return _subtract_segment_prefix(prefix)
+
+        # Leaky segmented scan (vectorized):
+        # y_t = beta^k * sum_{j=0..k} delta_{s+j} * beta^{-j}, where k is position within segment.
+        # local_pos = t - segment_start
+        local_pos = (t_idx - last_start).to(torch.float64)
+        beta_t = torch.tensor(float(beta), device=delta.device, dtype=torch.float64)
+        beta_pow = torch.pow(beta_t, local_pos).view(B, T, 1, 1)
+        beta_inv_pow = torch.pow(beta_t, -local_pos).view(B, T, 1, 1)
+
+        x = delta.to(torch.float64)
+        scaled = x * beta_inv_pow
+        scaled_prefix = torch.cumsum(scaled, dim=1)
+        seg_scaled_sum = _subtract_segment_prefix(scaled_prefix)
+        out = seg_scaled_sum * beta_pow
+        return out.to(delta.dtype)
+
+    def _gdh_write_probe_delta(self, write_core, x, gdh_heads: int, route_topk: int, gate_proj=None, eps: float = 1e-6):
+        bsz, n_tokens, d = x.shape
+        r = write_core.E_slots.shape[0]
+        d_h = d // gdh_heads
+
+        x_write = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        k_upd = torch.matmul(x_write, write_core.W_k_write)
+        v_upd = torch.tanh(torch.matmul(x_write, write_core.W_v_write))
+
+        e_slots = write_core.E_slots * torch.rsqrt(write_core.E_slots.pow(2).mean(dim=-1, keepdim=True) + eps)
+        q_slots = torch.matmul(e_slots, write_core.W_q_slots_global)
+
+        q_h = q_slots.view(r, gdh_heads, d_h)
+        k_h = k_upd.view(bsz, n_tokens, gdh_heads, d_h)
+        v_h = v_upd.view(bsz, n_tokens, gdh_heads, d_h)
+
+        logits = torch.einsum("rhd,bnhd->bnhr", q_h, k_h) / math.sqrt(d_h)
+        alpha_soft = torch.softmax(logits, dim=-1)
+        alpha = alpha_soft
+
+        if route_topk > 0 and route_topk < r:
+            top_idx = torch.topk(alpha, k=route_topk, dim=-1).indices
+            mask = torch.zeros_like(alpha)
+            mask.scatter_(-1, top_idx, 1.0)
+            alpha = alpha * mask
+            alpha = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        delta_heads = torch.einsum("bnhr,bnhd->bnhrd", alpha, v_h)
+        delta_raw = delta_heads.permute(0, 1, 3, 2, 4).contiguous().view(bsz, n_tokens, r, d)
+        delta = torch.einsum("bnrd,df->bnrf", delta_raw, write_core.W_o_write)
+        delta = write_core._apply_write_brain(delta, eps=eps)
+
+        g_write = None
+        if gate_proj is not None:
+            g_write = torch.sigmoid(gate_proj(x_write)).unsqueeze(-2)
+            delta = delta * g_write
+
+        return delta, alpha_soft, g_write
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', gdh_state_in=None, return_gdh_state=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -507,13 +709,29 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
 
         use_gdh = self.arch == "gdh"
+        usage_losses = []
+        gdh_boundary_mask = None
         if use_gdh:
             if kv_cache is not None:
                 raise NotImplementedError("GDH path with kv_cache is not implemented yet")
             gdh_slots = self.config.gdh_slots
             gdh_heads = self.config.n_head if self.config.gdh_write_heads <= 0 else self.config.gdh_write_heads
             assert self.config.n_embd % gdh_heads == 0, "n_embd must be divisible by gdh write heads"
-            sidecar = torch.zeros(B, T, gdh_slots, self.config.n_embd, device=x.device, dtype=x.dtype)
+            if self.config.gdh_segmented_scan:
+                gdh_boundary_mask = (idx == int(self.config.gdh_bos_token_id))
+
+            if gdh_state_in is not None:
+                assert gdh_state_in.shape == (B, gdh_slots, self.config.n_embd), (
+                    f"gdh_state_in must have shape {(B, gdh_slots, self.config.n_embd)}, got {tuple(gdh_state_in.shape)}"
+                )
+                sidecar = gdh_state_in.unsqueeze(1).expand(B, T, gdh_slots, self.config.n_embd).clone()
+                if gdh_boundary_mask is not None:
+                    # Carry state only until the first boundary token in the chunk.
+                    # Once a boundary starts, prior carry must not leak into later positions.
+                    pre_boundary = (torch.cumsum(gdh_boundary_mask.to(torch.int64), dim=1) == 0).unsqueeze(-1).unsqueeze(-1)
+                    sidecar = sidecar * pre_boundary.to(sidecar.dtype)
+            else:
+                sidecar = torch.zeros(B, T, gdh_slots, self.config.n_embd, device=x.device, dtype=x.dtype)
 
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -522,13 +740,38 @@ class GPT(nn.Module):
                 x = self.gdh_read[i].forward_sequence(x, sidecar, eps=1e-6)
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if use_gdh:
-                delta = self.gdh_write[i].forward_sequence_delta(
+                gate_proj = self.gdh_write_gate[i] if self.gdh_write_gate is not None else None
+                delta, alpha_soft, g_write = self._gdh_write_probe_delta(
+                    self.gdh_write[i],
                     x,
-                    sidecar,
-                    n_write_heads=gdh_heads,
+                    gdh_heads=gdh_heads,
+                    route_topk=self.config.gdh_route_topk,
+                    gate_proj=gate_proj,
                     eps=1e-6,
                 )
-                sidecar = sidecar + torch.cumsum(delta, dim=1)
+                # Final hard bound before temporal accumulation.
+                delta = torch.tanh(delta)
+
+                if self.config.gdh_usage_balance_lambda > 0.0:
+                    gate_weight = g_write.detach() if g_write is not None else torch.ones_like(alpha_soft[..., :1, :1])
+                    weighted_sum = (alpha_soft * gate_weight).sum(dim=(0, 1, 2))
+                    total_weight = gate_weight.sum() * gdh_heads
+                    usage = weighted_sum / (total_weight + 1e-9)
+                    usage_target = torch.full_like(usage, 1.0 / usage.shape[0])
+                    usage_losses.append((usage - usage_target).pow(2).mean())
+
+                if self.config.gdh_use_ema_scan and g_write is not None:
+                    sidecar = self._gdh_scan_accumulate_ema(
+                        delta,
+                        retention=g_write,
+                        boundary_mask=gdh_boundary_mask,
+                    )
+                else:
+                    sidecar = sidecar + self._gdh_scan_accumulate(
+                        delta,
+                        beta=self.config.gdh_scan_beta,
+                        boundary_mask=gdh_boundary_mask,
+                    )
 
         x = norm(x)
 
@@ -539,13 +782,30 @@ class GPT(nn.Module):
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
+        gdh_state_out = None
+        if use_gdh:
+            gdh_state_out = sidecar[:, -1]
+
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            ignore_index = -100 if (targets == -100).any() else -1
+            ce_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=ignore_index,
+                reduction=loss_reduction,
+            )
+            if use_gdh and self.config.gdh_usage_balance_lambda > 0.0 and usage_losses:
+                usage_loss = torch.stack(usage_losses).mean()
+                ce_loss = ce_loss + self.config.gdh_usage_balance_lambda * usage_loss
+            if return_gdh_state:
+                return ce_loss, gdh_state_out
+            return ce_loss
         else:
             # inference: just return the logits directly
+            if return_gdh_state:
+                return logits, gdh_state_out
             return logits
 
     @torch.inference_mode()

@@ -1,6 +1,6 @@
 # GDH Shared Understanding (Implementation Notes)
 
-Date: 2026-02-18 (updated 2026-02-23)
+Date: 2026-02-18 (updated 2026-02-26)
 
 This file captures the *intent* behind GDH so implementation stays aligned even if formal math is revised.
 
@@ -34,7 +34,7 @@ This file captures the *intent* behind GDH so implementation stays aligned even 
 
 ## Parallel training intent
 
-- Keep write path compatible with parallel training (prefix/cumsum style accumulation).
+- Keep write path compatible with parallel training (vectorized segmented-prefix accumulation).
 - No-forget-gate in v1 (additive state); handle stability via normalization + reset policy.
 
 ## Reset policy intent (v1)
@@ -72,9 +72,14 @@ This file captures the *intent* behind GDH so implementation stays aligned even 
   - `Q_slots = RMSNorm(E_slots) @ W_q_slots_global` (global/shared)
   - `K_upd = x_write @ W_k_write`, `V_upd = x_write @ W_v_write` (layer-local)
 - Read phase still attends to accumulated sidecar state (`S`) via global read K/V.
-- Mainline temporal integration in `nanochat/gpt.py` is currently pure additive scan:
-  - `sidecar = sidecar + torch.cumsum(delta, dim=1)` (equivalent to `beta=1.0`)
-- Boundary-reset behavior is still an intent/contract item; it is not currently enforced inside the mainline GPT GDH forward path.
+- Mainline temporal integration in `nanochat/gpt.py` is now BOS-aware segmented scan:
+  - `sidecar = sidecar + SegmentedScan(delta, boundary=(idx==gdh_bos_token_id), beta=gdh_scan_beta)`
+- Segmented scan implementation is vectorized (parallel tensor ops), preserving sequence-parallel training behavior while preventing cross-doc accumulation bleed.
+- Boundary-reset behavior is now enforced in mainline via the boundary mask.
+- Write path now applies a final hard bound before accumulation (`delta = tanh(delta)`) to cap update amplitude.
+- Optimizer now uses a lower LR bucket for tied/global GDH tensors (`W_k_read_global`, `W_v_read_global`, `E_slots`, `W_q_slots_global`, and write-brain globals when enabled).
+- Optional EMA scan mode (`gdh_use_ema_scan`) uses data-dependent per-token retention from write gate:
+  - `S_t = g_t * S_{t-1} + (1-g_t) * delta_t`, vectorized + boundary-aware.
 - Layer-sharing policy in `nanochat/gpt.py`:
   - shared across layers: `W_k_read_global`, `W_v_read_global`, `E_slots`, `W_q_slots_global`
   - layer-local: `W_k_write`, `W_v_write`, `W_o_write`, read-local params
@@ -100,6 +105,14 @@ These are active in `experiments/mqar_scan_beta_probe.py` for Stage-1 blindfold 
   - Bias initialized negative (e.g. `-2.0`) so writes start mostly closed.
   - Final write delta is multiplied by `sigmoid(g_write)`.
   - Same gate weighting is used in usage-balancing aggregation so low-gate/noisy tokens contribute less to slot-usage pressure.
+
+## Recurrent-doc loader mode (implemented for local training)
+
+- `scripts/local_base_train.py` now supports `--loader-mode recurrent_doc`.
+- In recurrent mode, each document is split into contiguous `T+1` chunks and emitted in-order.
+- `--recurrent-max-chunks-per-doc` caps how many chunks are taken from one document.
+- Optional GDH chunk-to-chunk state carry is available via `--gdh-recurrent-carry-state`.
+- Carry state is detached each step (TBPTT style) and BOS-aware.
 
 ## Future ideas backlog (not implemented yet)
 

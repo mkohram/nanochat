@@ -1,6 +1,6 @@
 # GDH (Gated Double Helix) — Current Architecture Spec
 
-Last updated: 2026-02-23
+Last updated: 2026-02-26
 
 This spec reflects the behavior currently implemented in:
 - `nanochat/gpt.py` (mainline GDH path)
@@ -25,6 +25,9 @@ Mainline GDH knobs (`GPTConfig`):
 - `gdh_use_read_gate` (bool)
 - `gdh_use_write_brain` (bool)
 - `gdh_write_brain_hidden_mult` (int)
+- `gdh_segmented_scan` (bool; default True)
+- `gdh_bos_token_id` (int; set from tokenizer in local training)
+- `gdh_use_ema_scan` (bool; when True, use write-gate-conditioned EMA scan)
 
 Probe-only knobs (`mqar_scan_beta_probe.py`):
 - `route_topk = K`
@@ -77,7 +80,7 @@ For each layer `i`, with local stream `X` and sidecar stream `S`:
 3. **Process (standard transformer block)**
 4. **Write proposal (local → sidecar delta)**
 5. **Temporal accumulation**
-   - `S ← S + cumsum(Δ, dim=time)`
+   - `S ← S + SegmentedScan(Δ, boundary=BOS, beta)`
 
 Important: current mainline order is **Read → Process → Write** (not Process → Write → Read).
 
@@ -123,7 +126,7 @@ Output fusion:
 From `X_proc`:
 - `x_write = RMSNorm(X_proc)`
 - `k_upd = x_write W_k_write`                       (`B×T×D`)
-- `v_upd = x_write W_v_write`                       (`B×T×D`)
+- `v_upd = tanh(x_write W_v_write)`                 (`B×T×D`, bounded write-value throttle)
 
 Slot queries:
 - `q_slots = RMSNorm(E_slots) W_q_slots_global`     (`R×D`)
@@ -138,7 +141,11 @@ Optional write-brain (if enabled):
 - `Δ ← Δ + MLP(RMSNorm(Δ))`, with `Linear → ReLU² → Linear`
 
 Mainline temporal update:
-- `S ← S_prev + cumsum(Δ, dim=1)`
+- Additive mode (default):
+  - `S ← S_prev + SegmentedScan(Δ, boundary_mask=(idx==gdh_bos_token_id), beta=gdh_scan_beta)`
+- EMA mode (`gdh_use_ema_scan=True`, requires write gate):
+  - `S_t ← g_t * S_{t-1} + (1 - g_t) * Δ_t`, with `g_t = sigmoid(write_gate_t)`
+  - implemented as vectorized segmented EMA scan (parallel tensor ops).
 
 ---
 
@@ -184,15 +191,37 @@ In `experiments/mqar_scan_beta_probe.py`:
      - `L_total = CE + λ_usage * mean_layers(L_usage_layer)`
 
 5. **Leaky scan option (`scan_beta`)**
-   - `β = 1.0`: pure `cumsum`.
-   - `0 < β < 1`: leaky recurrence `y_t = β y_{t-1} + Δ_t` (vectorized closed form).
+   - `β = 1.0`: segmented additive scan.
+   - `0 < β < 1`: segmented leaky recurrence `y_t = β y_{t-1} + Δ_t` (vectorized closed form).
 
 6. **Blindfold harness**
    - `WindowedGPT` forces SWA window on **all** layers (including final layer).
 
 ---
 
-## 9) Explicit non-claims (to avoid drift)
+## 9) Recurrent-doc training mode (local_base_train)
+
+Local training now supports two loader modes:
+- `bos_bestfit` (legacy packed mode)
+- `recurrent_doc` (new contiguous per-doc chunk mode)
+
+New local training flags:
+- `--loader-mode {bos_bestfit,recurrent_doc}`
+- `--recurrent-max-chunks-per-doc N`
+- `--gdh-recurrent-carry-state`
+
+`recurrent_doc` behavior:
+- each document is tokenized then split into contiguous windows of `T+1`
+- windows are yielded in-order for each doc, capped at `N` chunks per doc
+- short tails (< `T+1`) are dropped
+- no multi-doc packing inside one row
+
+When `--gdh-recurrent-carry-state` is enabled (GDH only):
+- model carries sidecar state chunk-to-chunk via `gdh_state_in` / `gdh_state_out`
+- carry is detached each step (TBPTT-style)
+- carry is BOS-aware and does not leak beyond first boundary token in the chunk
+
+## 10) Explicit non-claims (to avoid drift)
 
 The following are **not** current guaranteed mainline behavior:
 - Mandatory Shazeer `P_mean · f_mean` load-balance formula

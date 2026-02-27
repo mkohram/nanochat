@@ -444,7 +444,7 @@ class GDHWriteCore(nn.Module):
 
         x_write = _rms_norm(l_out_t, eps=eps)
         k_upd = x_write @ self.W_k_write
-        v_upd = x_write @ self.W_v_write
+        v_upd = torch.tanh(x_write @ self.W_v_write)
 
         e_slots = _rms_norm(self.E_slots, eps=eps)
         q_slots = e_slots @ self.W_q_slots_global
@@ -481,7 +481,7 @@ class GDHWriteCore(nn.Module):
 
         x_write = _rms_norm(local_out, eps=eps)                                 # [B,N,D]
         k_upd = torch.matmul(x_write, self.W_k_write)                           # [B,N,D]
-        v_upd = torch.matmul(x_write, self.W_v_write)                           # [B,N,D]
+        v_upd = torch.tanh(torch.matmul(x_write, self.W_v_write))               # [B,N,D]
 
         e_slots = _rms_norm(self.E_slots, eps=eps)                              # [R,D]
         q_slots = torch.matmul(e_slots, self.W_q_slots_global)                   # [R,D]

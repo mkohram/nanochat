@@ -31,6 +31,7 @@ import torch
 
 from nanochat.gpt import GPT, GPTConfig, norm as gpt_norm
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.recurrent_dataloader import tokenizing_distributed_data_loader_recurrent_doc, tokenizing_distributed_data_loader_with_state_recurrent_doc
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -56,12 +57,21 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="L", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL'). Local default is L for SDPA/GTX stability.")
+parser.add_argument("--force-swa-window", type=int, default=0, help="if >0, force this SWA window on ALL layers (including final layer); blindfold mode")
 parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "gdh"], help="model architecture path")
+parser.add_argument("--no-value-embeds", action="store_true", help="disable ResFormer-style value embeddings")
 parser.add_argument("--gdh-slots", type=int, default=16, help="number of GDH sidecar slots (used when --arch gdh)")
 parser.add_argument("--gdh-write-heads", type=int, default=-1, help="GDH write heads (-1 = use n_head)")
 parser.add_argument("--gdh-no-read-gate", action="store_true", help="disable GDH read gate (always-on sidecar read path)")
 parser.add_argument("--gdh-no-write-brain", action="store_true", help="disable GDH write-space residual brain (Linear->ReLU²->Linear)")
 parser.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4, help="GDH write-brain hidden width multiplier (hidden = mult * D)")
+parser.add_argument("--gdh-route-topk", type=int, default=0, help="GDH sparse top-k write routing (0 = dense)")
+parser.add_argument("--gdh-scan-beta", type=float, default=1.0, help="GDH temporal scan beta (1.0 = cumsum)")
+parser.add_argument("--gdh-use-ema-scan", action="store_true", help="use GDH EMA scan S_t = g*S_{t-1} + (1-g)*delta_t with write-gate retention")
+parser.add_argument("--gdh-usage-balance-lambda", type=float, default=0.0, help="GDH usage-balance auxiliary loss coefficient")
+parser.add_argument("--gdh-use-write-gate", action="store_true", help="enable GDH write gate (per-layer Linear(D->1), sigmoid)")
+parser.add_argument("--gdh-write-gate-bias", type=float, default=-2.0, help="initial bias for GDH write gate projections")
+parser.add_argument("--gdh-probe-warmstart-read-mixer", action="store_true", help="warm-start first two GDH read output mixers (probe parity)")
 parser.add_argument("--gate-log-every", type=int, default=10, help="log GDH gate telemetry every N steps (-1 = disable)")
 parser.add_argument("--gate-open-threshold", type=float, default=0.55, help="threshold used for gate open fraction telemetry")
 parser.add_argument("--train-log-every", type=int, default=10, help="log train metrics every N steps to align baseline/GDH telemetry density (-1 = disable)")
@@ -97,6 +107,10 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--loader-mode", type=str, default="bos_bestfit", choices=["bos_bestfit", "recurrent_doc"], help="train/val dataloader mode")
+parser.add_argument("--dataset", type=str, default="fineweb_edu", choices=["fineweb_edu", "tinystories"], help="text dataset source for local training")
+parser.add_argument("--recurrent-max-chunks-per-doc", type=int, default=5, help="max contiguous chunks taken from one doc in recurrent_doc loader")
+parser.add_argument("--gdh-recurrent-carry-state", action="store_true", help="carry GDH sidecar state across recurrent_doc chunks (detached TBPTT)")
 args = parser.parse_args()
 
 # Optional startup tracing to diagnose stalls in init path
@@ -182,12 +196,22 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        force_swa_window=args.force_swa_window,
         arch=args.arch,
         gdh_slots=args.gdh_slots,
         gdh_write_heads=args.gdh_write_heads,
         gdh_use_read_gate=not args.gdh_no_read_gate,
         gdh_use_write_brain=not args.gdh_no_write_brain,
         gdh_write_brain_hidden_mult=args.gdh_write_brain_hidden_mult,
+        gdh_route_topk=args.gdh_route_topk,
+        gdh_scan_beta=args.gdh_scan_beta,
+        gdh_use_ema_scan=args.gdh_use_ema_scan,
+        gdh_usage_balance_lambda=args.gdh_usage_balance_lambda,
+        gdh_use_write_gate=args.gdh_use_write_gate,
+        gdh_write_gate_bias=args.gdh_write_gate_bias,
+        gdh_probe_warmstart_read_mixer=args.gdh_probe_warmstart_read_mixer,
+        gdh_bos_token_id=tokenizer.get_bos_token_id(),
+        use_value_embeds=not args.no_value_embeds,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -407,9 +431,30 @@ if resuming and not args.resume_model_only:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 trace("train dataloader build start")
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-trace("train dataloader build done")
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+if args.loader_mode == "bos_bestfit":
+    if args.dataset != "fineweb_edu":
+        raise ValueError("bos_bestfit currently supports only --dataset fineweb_edu")
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+    )
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device
+    )
+elif args.loader_mode == "recurrent_doc":
+    train_loader = tokenizing_distributed_data_loader_with_state_recurrent_doc(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+        max_chunks_per_doc=args.recurrent_max_chunks_per_doc,
+        source_dataset=args.dataset,
+    )
+    build_val_loader = lambda: tokenizing_distributed_data_loader_recurrent_doc(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device,
+        max_chunks_per_doc=args.recurrent_max_chunks_per_doc,
+        source_dataset=args.dataset,
+    )
+else:
+    raise ValueError(f"Unknown loader mode: {args.loader_mode}")
 trace("first batch prefetch start")
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 trace("first batch prefetch done")
@@ -505,6 +550,7 @@ def collect_gdh_probe_telemetry(
             gdh_heads = m.config.n_head if m.config.gdh_write_heads <= 0 else m.config.gdh_write_heads
             sidecar = torch.zeros(bsz, n_tokens, gdh_slots, m.config.n_embd, device=x.device, dtype=x.dtype)
             cos_sin = m.cos[:, :n_tokens], m.sin[:, :n_tokens]
+            gdh_boundary_mask = (idx_tokens == int(getattr(m.config, "gdh_bos_token_id", 1))) if bool(getattr(m.config, "gdh_segmented_scan", True)) else None
 
             telemetry = {}
             gate_means, gate_stds, gate_open_fracs = [], [], []
@@ -516,9 +562,22 @@ def collect_gdh_probe_telemetry(
             for i, block in enumerate(m.transformer.h):
                 x = m.resid_lambdas[i] * x + m.x0_lambdas[i] * x0
 
-                x_read = gpt_norm(x)
-                if use_read_gate:
-                    g = torch.sigmoid(torch.matmul(x_read, m.gdh_read[i].W_g_read)).squeeze(-1).float()
+                ve = m.value_embeds[str(i)](idx_tokens) if str(i) in m.value_embeds else None
+                x = m.gdh_read[i].forward_sequence(x, sidecar, eps=1e-6)
+                x = block(x, ve, cos_sin, m.window_sizes[i], kv_cache=None)
+
+                gate_proj = m.gdh_write_gate[i] if m.gdh_write_gate is not None else None
+                delta, _, g_write = m._gdh_write_probe_delta(
+                    m.gdh_write[i],
+                    x,
+                    gdh_heads=gdh_heads,
+                    route_topk=getattr(m.config, "gdh_route_topk", 0),
+                    gate_proj=gate_proj,
+                    eps=1e-6,
+                )
+
+                if g_write is not None:
+                    g = g_write.squeeze(-1).squeeze(-1).float()
                 else:
                     g = torch.ones(bsz, n_tokens, device=x.device, dtype=torch.float32)
 
@@ -529,16 +588,19 @@ def collect_gdh_probe_telemetry(
                 gate_stds.append(gate_std)
                 gate_open_fracs.append(gate_open)
 
-                ve = m.value_embeds[str(i)](idx_tokens) if str(i) in m.value_embeds else None
-                x = m.gdh_read[i].forward_sequence(x, sidecar, eps=1e-6)
-                x = block(x, ve, cos_sin, m.window_sizes[i], kv_cache=None)
-                delta = m.gdh_write[i].forward_sequence_delta(
-                    x,
-                    sidecar,
-                    n_write_heads=gdh_heads,
-                    eps=1e-6,
-                )
-                sidecar = sidecar + torch.cumsum(delta, dim=1)
+                delta = torch.tanh(delta)
+                if bool(getattr(m.config, "gdh_use_ema_scan", False)) and g_write is not None:
+                    sidecar = m._gdh_scan_accumulate_ema(
+                        delta,
+                        retention=g_write,
+                        boundary_mask=gdh_boundary_mask,
+                    )
+                else:
+                    sidecar = sidecar + m._gdh_scan_accumulate(
+                        delta,
+                        beta=float(getattr(m.config, "gdh_scan_beta", 1.0)),
+                        boundary_mask=gdh_boundary_mask,
+                    )
 
                 delta_f = delta.float()
                 sidecar_f = sidecar.float()
@@ -553,9 +615,9 @@ def collect_gdh_probe_telemetry(
                 out_stds.append(out_std)
                 delta_abs_means.append(delta_abs_mean)
 
-                telemetry[f"gdh/layer_{i}/gate_mean"] = gate_mean
-                telemetry[f"gdh/layer_{i}/gate_std"] = gate_std
-                telemetry[f"gdh/layer_{i}/gate_open_frac"] = gate_open
+                telemetry[f"gdh/layer_{i}/write_gate_mean"] = gate_mean
+                telemetry[f"gdh/layer_{i}/write_gate_std"] = gate_std
+                telemetry[f"gdh/layer_{i}/write_gate_open_frac"] = gate_open
 
                 telemetry[f"gdh/layer_{i}/out_state_mean"] = out_mean
                 telemetry[f"gdh/layer_{i}/out_state_abs_mean"] = out_abs_mean
@@ -646,9 +708,9 @@ def collect_gdh_probe_telemetry(
         "gdh/use_read_gate": float(use_read_gate),
         "gdh/use_write_brain": float(use_write_brain),
         "gdh/write_brain_hidden_mult": float(getattr(m.config, "gdh_write_brain_hidden_mult", 0)),
-        "gdh/gate_mean": sum(gate_means) / len(gate_means),
-        "gdh/gate_std": sum(gate_stds) / len(gate_stds),
-        "gdh/gate_open_frac": sum(gate_open_fracs) / len(gate_open_fracs),
+        "gdh/write_gate_mean": sum(gate_means) / len(gate_means),
+        "gdh/write_gate_std": sum(gate_stds) / len(gate_stds),
+        "gdh/write_gate_open_frac": sum(gate_open_fracs) / len(gate_open_fracs),
         "gdh/out_state_mean": sum(out_means) / len(out_means),
         "gdh/out_state_abs_mean": sum(out_abs_means) / len(out_abs_means),
         "gdh/out_state_std": sum(out_stds) / len(out_stds),
@@ -683,6 +745,16 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+# Optional recurrent sidecar carry (GDH only)
+use_gdh_recurrent_carry = (
+    args.arch == "gdh"
+    and args.loader_mode == "recurrent_doc"
+    and args.gdh_recurrent_carry_state
+)
+gdh_state_carry = None
+chunk_loss_sum = {}
+chunk_loss_count = {}
 
 # Go!
 while True:
@@ -777,12 +849,30 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    current_chunk_idx = None
     for micro_step in range(grad_accum_steps):
+        if args.loader_mode == "recurrent_doc":
+            current_chunk_idx = int(dataloader_state_dict.get("chunk_idx_in_doc", -1))
         with autocast_ctx:
-            loss = model(x, y)
+            if use_gdh_recurrent_carry:
+                loss, gdh_state_next = model(
+                    x,
+                    y,
+                    gdh_state_in=gdh_state_carry,
+                    return_gdh_state=True,
+                )
+            else:
+                loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        if use_gdh_recurrent_carry:
+            # Legacy carry decay (0.85) for additive scan. For EMA scan, recurrence already applies
+            # per-token retention and bounded updates, so keep carry unscaled.
+            if bool(getattr(model.config, "gdh_use_ema_scan", False)):
+                gdh_state_carry = gdh_state_next.detach()
+            else:
+                gdh_state_carry = gdh_state_next.detach() * 0.85
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -796,6 +886,9 @@ while True:
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    if args.loader_mode == "recurrent_doc" and current_chunk_idx is not None and current_chunk_idx >= 0:
+        chunk_loss_sum[current_chunk_idx] = chunk_loss_sum.get(current_chunk_idx, 0.0) + train_loss_f
+        chunk_loss_count[current_chunk_idx] = chunk_loss_count.get(current_chunk_idx, 0) + 1
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -842,9 +935,9 @@ while True:
         if gdh_probe_telemetry:
             if gate_log_due:
                 print0(
-                    f"gdh gate | mean: {gdh_probe_telemetry['gdh/gate_mean']:.4f} | "
-                    f"std: {gdh_probe_telemetry['gdh/gate_std']:.4f} | "
-                    f"open>{args.gate_open_threshold:.2f}: {gdh_probe_telemetry['gdh/gate_open_frac']:.3f}"
+                    f"gdh write_gate | mean: {gdh_probe_telemetry['gdh/write_gate_mean']:.4f} | "
+                    f"std: {gdh_probe_telemetry['gdh/write_gate_std']:.4f} | "
+                    f"open>{args.gate_open_threshold:.2f}: {gdh_probe_telemetry['gdh/write_gate_open_frac']:.3f}"
                 )
             print0(
                 f"gdh out_state | mean: {gdh_probe_telemetry['gdh/out_state_mean']:.6f} | "
@@ -873,6 +966,17 @@ while True:
             "train/epoch": epoch,
             **gdh_probe_telemetry,
         }
+        if args.loader_mode == "recurrent_doc" and current_chunk_idx is not None and current_chunk_idx >= 0:
+            log_data["train/chunk_id_current"] = float(current_chunk_idx)
+            log_data["train/chunk_loss_current"] = train_loss_f
+            for k in sorted(chunk_loss_sum.keys()):
+                c = chunk_loss_count.get(k, 0)
+                if c > 0:
+                    log_data[f"train/chunk_loss_avg_{k}"] = chunk_loss_sum[k] / c
+            if 0 in chunk_loss_sum and current_chunk_idx in chunk_loss_sum and current_chunk_idx != 0:
+                c0 = chunk_loss_sum[0] / max(chunk_loss_count.get(0, 1), 1)
+                ck = chunk_loss_sum[current_chunk_idx] / max(chunk_loss_count.get(current_chunk_idx, 1), 1)
+                log_data["train/chunk_loss_gap_vs_0"] = ck - c0
         log_to_wandb(step, log_data)
 
     # state update
