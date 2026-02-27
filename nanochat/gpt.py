@@ -550,49 +550,43 @@ class GPT(nn.Module):
         return optimizer
 
     def _gdh_scan_accumulate_ema(self, delta, retention, boundary_mask=None):
-        """Vectorized segmented EMA scan.
+        """Vectorized segmented EMA scan via associative prefix composition.
 
-        Recurrence per token: S_t = g_t * S_{t-1} + (1 - g_t) * delta_t
-        where g_t in [0,1] (retention). With bounded delta, this is a convex update.
+        Recurrence per token: S_t = g_t * S_{t-1} + (1 - g_t) * delta_t, with g_t in [0,1].
+        We represent each step as affine map f_t(s)=g_t*s+b_t where b_t=(1-g_t)*delta_t,
+        and run a Hillis-Steele inclusive scan under composition:
+          (g2,b2) ∘ (g1,b1) = (g2*g1, b2 + g2*b1).
+        This avoids unstable divide-by-cumprod numerics and stays sequence-parallel.
         """
-        g = retention.clamp(1e-6, 1.0 - 1e-6).to(delta.dtype)
-        one_minus_g = (1.0 - g)
-        b = one_minus_g * delta
+        g = retention.clamp(0.0, 1.0).to(delta.dtype)  # [B,T,1,1]
+        if boundary_mask is not None:
+            bmask = boundary_mask.to(torch.bool)
+            assert bmask.shape == delta.shape[:2], f"boundary_mask shape {bmask.shape} must match delta (B,T) {delta.shape[:2]}"
+            # Reset at boundaries: y_t = b_t by setting multiplier on prior state to 0.
+            g = torch.where(bmask.unsqueeze(-1).unsqueeze(-1), torch.zeros_like(g), g)
 
-        if boundary_mask is None:
-            logg = torch.log(g.to(torch.float64))
-            logp = torch.cumsum(logg, dim=1)
-            p = torch.exp(logp)
-            u = b.to(torch.float64) / p
-            y = p * torch.cumsum(u, dim=1)
-            return y.to(delta.dtype)
+        b = (1.0 - g) * delta  # [B,T,R,D]
 
-        bmask = boundary_mask.to(torch.bool)
-        assert bmask.shape == delta.shape[:2], f"boundary_mask shape {bmask.shape} must match delta (B,T) {delta.shape[:2]}"
+        # Inclusive scan of affine pairs (g,b) along token dimension.
+        pref_g = g
+        pref_b = b
+        T = delta.shape[1]
+        offset = 1
+        while offset < T:
+            sg = torch.roll(pref_g, shifts=offset, dims=1)
+            sb = torch.roll(pref_b, shifts=offset, dims=1)
 
-        B, T = bmask.shape
-        t_idx = torch.arange(T, device=delta.device, dtype=torch.long).view(1, T).expand(B, T)
-        neg_inf = torch.full_like(t_idx, -10**9)
-        start_pos = torch.where(bmask, t_idx, neg_inf)
-        last_start, _ = torch.cummax(start_pos, dim=1)
+            # Identity for rolled-in prefix positions.
+            sg[:, :offset] = 1.0
+            sb[:, :offset] = 0.0
 
-        def _subtract_segment_prefix(prefix_tensor):
-            prev_idx = (last_start - 1).clamp_min(0)
-            gather_idx = prev_idx.view(B, T, 1, 1).expand(B, T, prefix_tensor.size(2), prefix_tensor.size(3))
-            prefix_prev = torch.gather(prefix_tensor, dim=1, index=gather_idx)
-            has_prev = (last_start > 0).view(B, T, 1, 1)
-            return prefix_tensor - torch.where(has_prev, prefix_prev, torch.zeros_like(prefix_prev))
+            # Compose current prefix with shifted prefix: cur ∘ prev
+            pref_b = pref_b + pref_g * sb
+            pref_g = pref_g * sg
+            offset <<= 1
 
-        logg = torch.log(g.to(torch.float64))
-        logp_prefix = torch.cumsum(logg, dim=1)
-        logp_local = _subtract_segment_prefix(logp_prefix)
-        p_local = torch.exp(logp_local)
-
-        u = b.to(torch.float64) / p_local
-        u_prefix = torch.cumsum(u, dim=1)
-        u_local = _subtract_segment_prefix(u_prefix)
-        y = p_local * u_local
-        return y.to(delta.dtype)
+        # With zero initial state, accumulated EMA state is prefix b component.
+        return torch.nan_to_num(pref_b, nan=0.0, posinf=1.0, neginf=-1.0)
 
     def _gdh_scan_accumulate(self, delta, beta: float, boundary_mask=None):
         if boundary_mask is None:

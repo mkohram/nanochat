@@ -512,6 +512,11 @@ def _to_wandb_histogram(t: torch.Tensor, max_points: int):
     flat = t.detach().float().reshape(-1)
     if flat.numel() == 0:
         return wandb.Histogram([0.0])
+    # Guard against NaN/Inf so telemetry never crashes training.
+    finite = torch.isfinite(flat)
+    if not finite.any():
+        return wandb.Histogram([0.0])
+    flat = flat[finite]
     if flat.numel() > max_points:
         stride = max(flat.numel() // max_points, 1)
         flat = flat[::stride][:max_points]

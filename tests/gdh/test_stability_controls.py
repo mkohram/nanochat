@@ -54,6 +54,38 @@ def test_ema_scan_with_tanh_delta_stays_bounded():
     assert state.abs().max().item() <= 1.0001
 
 
+def test_ema_scan_no_nan_with_extreme_retention_values():
+    cfg = GPTConfig(
+        sequence_len=32,
+        vocab_size=64,
+        n_layer=1,
+        n_head=4,
+        n_kv_head=4,
+        n_embd=32,
+        window_pattern="L",
+        arch="gdh",
+        gdh_slots=4,
+        gdh_write_heads=4,
+        gdh_use_read_gate=False,
+        gdh_use_write_gate=True,
+        gdh_use_ema_scan=True,
+    )
+    model = GPT(cfg)
+    model.init_weights()
+
+    B, T, R, D = 2, 256, cfg.gdh_slots, cfg.n_embd
+    torch.manual_seed(1)
+    delta = torch.tanh(torch.randn(B, T, R, D) * 20.0)
+    # Push near-extreme gate values to stress numerical stability.
+    retention = torch.sigmoid(torch.randn(B, T, 1, 1) * 20.0)
+    boundary = torch.zeros(B, T, dtype=torch.bool)
+    boundary[:, ::64] = True
+
+    state = model._gdh_scan_accumulate_ema(delta, retention, boundary_mask=boundary)
+    assert torch.isfinite(state).all()
+    assert state.abs().max().item() <= 1.0001
+
+
 def test_gdh_global_params_use_lower_lr_group():
     cfg = GPTConfig(
         sequence_len=16,
