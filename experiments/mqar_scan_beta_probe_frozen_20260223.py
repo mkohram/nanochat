@@ -134,7 +134,6 @@ def _write_delta_and_alpha(
     n_write_heads: int,
     route_topk: int,
     eps: float,
-    gate_proj: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Mirror mainline GDH write delta with optional top-k routing.
 
@@ -176,10 +175,6 @@ def _write_delta_and_alpha(
     delta = write_core._apply_write_brain(delta, eps=eps)
 
     g_write = None
-    if gate_proj is not None:
-        g_write = torch.sigmoid(gate_proj(x_write)).unsqueeze(-2)  # [B,N,1,1]
-        delta = delta * g_write
-
     return delta, alpha, alpha_soft, g_write
 
 
@@ -249,14 +244,6 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
 
     if args.arch == "gdh":
         _apply_legacy_20260223_gdh_freeze(model)
-
-        # Ad-hoc Write Gate injection (probe-era scalar gate path)
-        model.g_write_projs = torch.nn.ModuleList([
-            torch.nn.Linear(cfg.n_embd, 1) for _ in range(cfg.n_layer)
-        ]).to(device)
-        for proj in model.g_write_projs:
-            torch.nn.init.normal_(proj.weight, mean=0.0, std=0.02)
-            torch.nn.init.constant_(proj.bias, -2.0)
 
     return model
 
@@ -384,8 +371,6 @@ def _forward_gdh(
         ve = model.value_embeds[str(i)](idx) if str(i) in model.value_embeds else None
         x = block(x, ve, cos_sin, model.window_sizes[i], kv_cache=None)
 
-        gate_proj = model.g_write_projs[i] if hasattr(model, "g_write_projs") else None
-
         delta, alpha, alpha_soft, g = _write_delta_and_alpha(
             model.gdh_write[i],
             x,
@@ -393,7 +378,6 @@ def _forward_gdh(
             n_write_heads=gdh_heads,
             route_topk=route_topk,
             eps=1e-6,
-            gate_proj=gate_proj,
         )
 
         # Routing usage balancing (layer-local): encourage uniform slot usage.

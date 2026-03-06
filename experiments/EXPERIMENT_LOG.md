@@ -226,3 +226,36 @@ We found two issues for GDH experiments under BOS best-fit packing:
     - Step 500: Acc 6.25%, Cos 0.83.
     - Step 2500: Acc 37.5%, Cos 0.88.
     - Final: [Pending]
+
+---
+
+## 2026-03-05: Minimal probe update + latest win (no write gate)
+
+### Change
+- Simplified `experiments/mqar_scan_beta_probe_frozen_20260223.py` by removing probe write-gate path:
+  - removed ad-hoc `model.g_write_projs` injection
+  - removed `gate_proj` plumbing in `_write_delta_and_alpha`
+  - removed `--disable-write-gate` flag (no longer needed)
+- Probe GDH now runs **without** write gate by default in this frozen harness.
+
+### Latest reproduced win (blind setup, no write gate)
+- **Run file:** `experiments/out/mqar_scan_beta_probe_20260305_223059.json`
+- **Config:**
+  - `arch=gdh`, `beta=1.0`, `steps=5000`, `log_every=500`
+  - `sequence_len=64`, `vocab_size=128`
+  - `n_layer=3`, `n_head=4`, `n_embd=64`
+  - `gdh_slots=8`, `route_topk=4`, `usage_balance_lambda=0.01`
+  - `swa_window=8`, `n_pairs=2`, `n_queries=2`, `gap_min=16`, `gap_max=32`
+  - vocab partition: `key=32`, `value=32`, `query_offset=64`, `filler_offset=96`, `filler_vocab=32`
+- **Final metrics:**
+  - `eval_acc_top1_last=0.6875`
+  - `eval_acc_top5_last=0.9375`
+  - `eval_mrr_last=0.8247`
+  - `eval_ce_last=0.9933`
+  - `slot_cos_last=0.8867`
+
+### Baseline reference (same blind setup)
+- `experiments/out/mqar_scan_beta_probe_20260305_220344.json`
+- `eval_acc_top1_last=0.0`
+
+**Takeaway:** In this easy blind regime, Top-K slot routing + sidecar path reproduces the win without requiring a write gate.
