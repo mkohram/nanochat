@@ -148,7 +148,7 @@ def test_invalid_head_count_raises():
         gdh_oracle_layer(L, S_prev, params, n_write_heads=3)
 
 
-def test_read_gate_strength_controls_injection_magnitude():
+def test_read_mute_gate_strength_controls_injection_magnitude():
     B, N, D, R, h = 1, 5, 8, 3, 2
     torch.manual_seed(33)
 
@@ -158,12 +158,12 @@ def test_read_gate_strength_controls_injection_magnitude():
     params_off = make_oracle_params(d=D, n_slots=R, r=2, h=h, seed=101)
     params_off.W_self_q.zero_(); params_off.W_self_k.zero_(); params_off.W_self_v.zero_(); params_off.W_self_o.zero_()
     params_off.W_mlp_in.zero_(); params_off.W_mlp_out.zero_(); params_off.W_o_write.zero_()
-    params_off.W_g_read.fill_(-20.0)
+    params_off.W_g_read_mute.zero_(); params_off.b_g_read_mute.fill_(-20.0)
 
     params_on = make_oracle_params(d=D, n_slots=R, r=2, h=h, seed=101)
     params_on.W_self_q.zero_(); params_on.W_self_k.zero_(); params_on.W_self_v.zero_(); params_on.W_self_o.zero_()
     params_on.W_mlp_in.zero_(); params_on.W_mlp_out.zero_(); params_on.W_o_write.zero_()
-    params_on.W_g_read.fill_(20.0)
+    params_on.W_g_read_mute.zero_(); params_on.b_g_read_mute.fill_(20.0)
 
     L_out_off, _, _ = gdh_oracle_layer(L, S_prev, params_off, n_write_heads=h)
     L_out_on, _, _ = gdh_oracle_layer(L, S_prev, params_on, n_write_heads=h)
@@ -173,35 +173,6 @@ def test_read_gate_strength_controls_injection_magnitude():
 
     assert on_mag > off_mag + 1e-5, f"Expected stronger gate to inject more, got on={on_mag:.6g}, off={off_mag:.6g}"
 
-
-def test_gdh_layer_no_read_gate_mode_ignores_gate_parameters():
-    B, N, D, R, h = 1, 5, 8, 3, 2
-    local, sidecar_prev = _tiny_inputs(B=B, N=N, D=D, R=R, seed=99)
-
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h, use_read_gate=False)
-    layer = GDHLayer(cfg)
-
-    out_a = layer.read.forward_sequence(local, sidecar_prev, eps=1e-6)
-
-    with torch.no_grad():
-        layer.read.W_g_read.fill_(123.0)
-        layer.read.W_g_side.fill_(-456.0)
-        layer.read.w_g_interaction.fill_(7.0)
-        layer.read.w_g_confidence.fill_(-7.0)
-        layer.read.w_g_novelty.fill_(3.0)
-        layer.read.w_g_temp.fill_(5.0)
-        layer.read.w_g_temp_adv.fill_(-4.0)
-        layer.read.w_g_synergy.fill_(2.0)
-        layer.read.w_g_querymatch.fill_(9.0)
-        layer.read.w_g_queryadv.fill_(-9.0)
-
-    out_b = layer.read.forward_sequence(local, sidecar_prev, eps=1e-6)
-    assert torch.allclose(out_a, out_b, atol=1e-6, rtol=1e-6)
-
-
-# -----------------------------------------------------------------------------
-# Decomposed oracle tests
-# -----------------------------------------------------------------------------
 
 def test_decomposed_oracle_shapes_and_finite_values():
     B, N, D, R, h = 2, 6, 8, 3, 2
@@ -356,7 +327,8 @@ def _copy_dense_weights_into_decomposed(dense, decomp):
     decomp.W_k_read_global = dense.W_k_read_global.clone()
     decomp.W_v_read_global = dense.W_v_read_global.clone()
     decomp.W_o_read = dense.W_o_read.clone()
-    decomp.W_g_read = dense.W_g_read.clone()
+    decomp.W_g_read_mute = dense.W_g_read_mute.clone()
+    decomp.b_g_read_mute = dense.b_g_read_mute.clone()
 
     decomp.W_self_q = dense.W_self_q.clone()
     decomp.W_self_k = dense.W_self_k.clone()
@@ -469,30 +441,119 @@ def test_gdh_write_eslots_prenorm_is_nearly_scale_invariant_for_positive_rescale
     assert torch.allclose(delta_a, delta_b, atol=2e-5, rtol=1e-4)
 
 
+
+
+def _read_only_output(layer: GDHLayer, local: torch.Tensor, sidecar_prev: torch.Tensor) -> torch.Tensor:
+    """Read-only helper: disables process/write paths and returns read output."""
+    with torch.no_grad():
+        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
+        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
+        layer.write.W_o_write.zero_()
+    out = layer.read.forward_sequence(local, sidecar_prev, eps=1e-6)
+    return out
+
+
+def test_read_mute_bias_controls_injection_strength_monotonic():
+    B, N, D, R, h = 1, 5, 8, 3, 2
+    torch.manual_seed(99)
+    local = torch.rand(B, N, D)
+    sidecar_prev = torch.rand(B, N, R, D)
+
+    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h, use_read_gate=False)
+    layer = GDHLayer(cfg)
+
+    with torch.no_grad():
+        layer.read.W_q_read.copy_(torch.eye(D))
+        layer.read.W_k_read_global.copy_(torch.eye(D))
+        layer.read.W_v_read_global.copy_(torch.eye(D))
+        layer.read.W_o_read.copy_(torch.eye(D))
+        layer.read.W_g_read_mute.zero_()
+
+        layer.read.b_g_read_mute.fill_(-8.0)
+        out_lo = _read_only_output(layer, local, sidecar_prev)
+
+        layer.read.b_g_read_mute.fill_(+8.0)
+        out_hi = _read_only_output(layer, local, sidecar_prev)
+
+    lo_mag = (out_lo - local).abs().mean().item()
+    hi_mag = (out_hi - local).abs().mean().item()
+    assert hi_mag > lo_mag + 1e-5
+
+
+def test_read_mute_weight_can_quiet_high_activation_tokens():
+    B, N, D, R, h = 1, 4, 8, 3, 2
+    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h, use_read_gate=False)
+    layer = GDHLayer(cfg)
+
+    local = torch.zeros(B, N, D)
+    local[:, 2:, :] = 1.0
+    sidecar_prev = torch.randn(B, N, R, D)
+
+    with torch.no_grad():
+        layer.read.W_q_read.copy_(torch.eye(D))
+        layer.read.W_k_read_global.copy_(torch.eye(D))
+        layer.read.W_v_read_global.copy_(torch.eye(D))
+        layer.read.W_o_read.copy_(torch.eye(D))
+        layer.read.W_g_read_mute.fill_(-4.0)
+        layer.read.b_g_read_mute.fill_(0.0)
+
+    out = _read_only_output(layer, local, sidecar_prev)
+    inj = (out - local).abs().mean(dim=-1).squeeze(0)
+    assert inj[2:].mean().item() < inj[:2].mean().item()
+
+
+def test_read_mute_disabled_recovers_unmuted_read_path():
+    B, N, D, R, h = 1, 3, 8, 2, 2
+    local = torch.randn(B, N, D)
+    sidecar_prev = torch.randn(B, N, R, D)
+
+    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h, use_read_gate=False)
+    layer = GDHLayer(cfg)
+    layer.read.use_read_mute_gate = False
+
+    with torch.no_grad():
+        layer.read.W_q_read.copy_(torch.eye(D))
+        layer.read.W_k_read_global.copy_(torch.eye(D))
+        layer.read.W_v_read_global.copy_(torch.eye(D))
+        layer.read.W_o_read.copy_(torch.eye(D))
+        layer.read.W_g_read_mute.fill_(-100.0)
+        layer.read.b_g_read_mute.fill_(-100.0)
+
+    out = _read_only_output(layer, local, sidecar_prev)
+    # Even with extreme mute params, disabling mute gate should keep non-trivial injection.
+    assert (out - local).abs().mean().item() > 1e-4
+
+
+def test_read_mute_oracle_dense_path_matches_layer():
+    B, N, D, R, h = 2, 6, 8, 3, 2
+    local, sidecar_prev = _tiny_inputs(B=B, N=N, D=D, R=R, seed=123)
+    boundary = torch.tensor([[1, 0, 0, 1, 0, 0], [1, 0, 1, 0, 0, 0]], dtype=torch.bool)
+
+    oracle_params = make_oracle_params(d=D, n_slots=R, r=2, h=h, seed=11)
+    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h, use_read_gate=False)
+    layer = GDHLayer(cfg)
+    _copy_dense_oracle_weights_to_layer(layer, oracle_params)
+
+    with torch.no_grad():
+        # keep process/write aligned with oracle copy helper defaults
+        pass
+
+    layer_local_out, layer_delta, layer_s_curr = layer.forward(local, sidecar_prev, boundary_mask=boundary)
+    oracle_local_out, oracle_delta, oracle_s_curr = gdh_oracle_layer(
+        local, sidecar_prev, oracle_params, n_write_heads=h, boundary_mask=boundary
+    )
+
+    assert torch.allclose(layer_local_out, oracle_local_out, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(layer_delta, oracle_delta, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(layer_s_curr, oracle_s_curr, atol=2e-5, rtol=2e-5)
 def _copy_dense_oracle_weights_to_layer(layer: GDHLayer, p):
     with torch.no_grad():
         layer.read.W_q_read.copy_(p.W_q_read)
         layer.read.W_k_read_global.copy_(p.W_k_read_global)
         layer.read.W_v_read_global.copy_(p.W_v_read_global)
         layer.read.W_o_read.copy_(p.W_o_read)
-        # New competitive gate reduces to sigmoid(a) when logits are [0, -a].
-        layer.read.W_g_read.copy_(-p.W_g_read)
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_temp_adv.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-        layer.read.w_g_queryadv2.zero_()
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconf.zero_()
-        layer.read.w_g_queryresid.zero_()
-        layer.read.w_g_advconfnovel.zero_()
-        layer.read.w_g_localquery.zero_()
-        layer.read.w_g_localredundancy.zero_()
+        layer.read.W_g_read_mute.copy_(p.W_g_read_mute)
+        layer.read.b_g_read_mute.copy_(p.b_g_read_mute)
 
         layer.process.W_self_q.copy_(p.W_self_q)
         layer.process.W_self_k.copy_(p.W_self_k)
@@ -506,776 +567,6 @@ def _copy_dense_oracle_weights_to_layer(layer: GDHLayer, p):
         layer.write.W_k_write.copy_(p.W_k_write)
         layer.write.W_v_write.copy_(p.W_v_write)
         layer.write.W_o_write.copy_(p.W_o_write)
-
-
-def test_gdh_read_competitive_gate_prefers_sidecar_when_side_logit_wins():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()               # neutral local logit
-        layer.read.w_g_interaction.zero_()        # isolate 2-logit competition
-        layer.read.w_g_confidence.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar = torch.ones(B, N, R, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.W_g_side.fill_(-4.0)
-    out_low, _, _ = layer(local, sidecar, boundary)
-
-    with torch.no_grad():
-        layer.read.W_g_side.fill_(4.0)
-    out_high, _, _ = layer(local, sidecar, boundary)
-
-    low_delta = (out_low - local).abs().mean().item()
-    high_delta = (out_high - local).abs().mean().item()
-    assert high_delta > low_delta + 1e-3
-
-
-def test_gdh_read_interaction_gate_opens_more_when_sidecar_aligns():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        # Isolate read gate behavior.
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.fill_(6.0)
-        layer.read.w_g_confidence.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_aligned = torch.ones(B, N, R, D)
-    sidecar_anti = -torch.ones(B, N, R, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    out_aligned, _, _ = layer(local, sidecar_aligned, boundary)
-    out_anti, _, _ = layer(local, sidecar_anti, boundary)
-
-    # Alignment-sensitive gating should favor sidecar-aligned reads.
-    aligned_delta = (out_aligned - local).abs().mean().item()
-    anti_delta = (out_anti - local).abs().mean().item()
-    assert aligned_delta > anti_delta + 1e-3
-
-
-def test_gdh_read_confidence_term_can_increase_gate_opening():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar = torch.ones(B, N, R, D)
-    sidecar[0, 0, 1] = -torch.ones(D)
-    sidecar[0, 0, 2] = -torch.ones(D)
-    # One slot aligned with query, others anti-aligned -> low-entropy read attention.
-
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-    with torch.no_grad():
-        layer.read.w_g_confidence.zero_()
-    out_no_conf, _, _ = layer(local, sidecar, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_confidence.fill_(8.0)
-    out_with_conf, _, _ = layer(local, sidecar, boundary)
-
-    no_conf_delta = (out_no_conf - local).abs().mean().item()
-    with_conf_delta = (out_with_conf - local).abs().mean().item()
-    assert with_conf_delta > no_conf_delta + 1e-3
-
-
-def test_gdh_read_centered_confidence_can_reduce_diffuse_retrieval_opening():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar = torch.ones(B, N, R, D)  # identical slots -> diffuse/uniform read attention
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_confidence.zero_()
-    out_no_conf, _, _ = layer(local, sidecar, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_confidence.fill_(8.0)
-    out_with_conf, _, _ = layer(local, sidecar, boundary)
-
-    no_conf_delta = (out_no_conf - local).abs().mean().item()
-    with_conf_delta = (out_with_conf - local).abs().mean().item()
-    assert with_conf_delta < no_conf_delta - 1e-3
-
-
-def test_gdh_read_temperature_term_sharpens_confident_and_flattens_diffuse_routing():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.fill_(1.0)
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_synergy.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_sharp = torch.ones(B, N, R, D)
-    sidecar_sharp[0, 0, 1] = -torch.ones(D)
-    sidecar_sharp[0, 0, 2] = -torch.ones(D)
-    sidecar_diffuse = torch.ones(B, N, R, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_temp.zero_()
-    out_sharp_no_temp, _, _ = layer(local, sidecar_sharp, boundary)
-    out_diffuse_no_temp, _, _ = layer(local, sidecar_diffuse, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_temp.fill_(6.0)
-    out_sharp_with_temp, _, _ = layer(local, sidecar_sharp, boundary)
-    out_diffuse_with_temp, _, _ = layer(local, sidecar_diffuse, boundary)
-
-    sharp_no_temp = (out_sharp_no_temp - local).abs().mean().item()
-    diffuse_no_temp = (out_diffuse_no_temp - local).abs().mean().item()
-    sharp_with_temp = (out_sharp_with_temp - local).abs().mean().item()
-    diffuse_with_temp = (out_diffuse_with_temp - local).abs().mean().item()
-
-    baseline_gap = sharp_no_temp - diffuse_no_temp
-    with_temp_gap = sharp_with_temp - diffuse_with_temp
-    assert with_temp_gap > baseline_gap + 1e-3
-
-
-def test_gdh_read_queryadv_temperature_prefers_positive_query_advantage():
-    B, N, D, R, h = 1, 1, 8, 2, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        W_q = torch.diag(torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=torch.float32))
-        layer.read.W_q_read.copy_(W_q)
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.fill_(0.5)
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconf.zero_()
-        layer.read.w_g_advconfnovel.zero_()
-        layer.read.w_g_localquery.zero_()
-        layer.read.w_g_localredundancy.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    q_vec = torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=local.dtype)
-    sidecar_pos = torch.zeros(B, N, R, D)
-    sidecar_pos[0, 0, 0] = q_vec
-    sidecar_pos[0, 0, 1] = -q_vec
-    sidecar_neg = torch.zeros(B, N, R, D)
-    sidecar_neg[0, 0, 0] = -q_vec
-    sidecar_neg[0, 0, 1] = -q_vec
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_temp_adv.zero_()
-    out_pos_no_temp, _, _ = layer(local, sidecar_pos, boundary)
-    out_neg_no_temp, _, _ = layer(local, sidecar_neg, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_temp_adv.fill_(6.0)
-    out_pos_with_temp, _, _ = layer(local, sidecar_pos, boundary)
-    out_neg_with_temp, _, _ = layer(local, sidecar_neg, boundary)
-
-    pos_no = (out_pos_no_temp - local).abs().mean().item()
-    neg_no = (out_neg_no_temp - local).abs().mean().item()
-    pos_yes = (out_pos_with_temp - local).abs().mean().item()
-    neg_yes = (out_neg_with_temp - local).abs().mean().item()
-
-    assert pos_yes > pos_no + 1e-3
-    assert abs(neg_yes - neg_no) < 1e-3
-
-
-def test_gdh_read_novelty_term_prefers_nonredundant_sidecar_content():
-    B, N, D, R, h = 1, 1, 8, 1, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.fill_(8.0)
-        layer.read.w_g_synergy.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_redundant = torch.ones(B, N, R, D)
-    orth = torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=local.dtype).view(1, 1, 1, D)
-    sidecar_novel = orth.clone()
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    out_redundant, _, _ = layer(local, sidecar_redundant, boundary)
-    out_novel, _, _ = layer(local, sidecar_novel, boundary)
-
-    redundant_delta = (out_redundant - local).abs().mean().item()
-    novel_delta = (out_novel - local).abs().mean().item()
-    assert novel_delta > redundant_delta + 1e-3
-
-
-def test_gdh_read_confidence_novelty_synergy_prefers_sharp_novel_retrieval():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.fill_(8.0)
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    # high confidence + high novelty: one orthogonal slot, two anti-aligned distractors.
-    sidecar_sharp_novel = torch.zeros(B, N, R, D)
-    sidecar_sharp_novel[0, 0, 0] = torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=local.dtype)
-    sidecar_sharp_novel[0, 0, 1] = -torch.ones(D)
-    sidecar_sharp_novel[0, 0, 2] = -torch.ones(D)
-
-    # high confidence + low novelty: one redundant slot, two anti-aligned distractors.
-    sidecar_sharp_redundant = torch.zeros(B, N, R, D)
-    sidecar_sharp_redundant[0, 0, 0] = torch.ones(D)
-    sidecar_sharp_redundant[0, 0, 1] = -torch.ones(D)
-    sidecar_sharp_redundant[0, 0, 2] = -torch.ones(D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    out_sharp_novel, _, _ = layer(local, sidecar_sharp_novel, boundary)
-    out_sharp_redundant, _, _ = layer(local, sidecar_sharp_redundant, boundary)
-
-    sharp_novel_delta = (out_sharp_novel - local).abs().mean().item()
-    sharp_redundant_delta = (out_sharp_redundant - local).abs().mean().item()
-    assert sharp_novel_delta > sharp_redundant_delta + 1e-3
-
-
-def test_gdh_read_querymatch_term_prefers_query_aligned_retrieval():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.fill_(8.0)
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_query_aligned = torch.zeros(B, N, R, D)
-    sidecar_query_aligned[0, 0, 0] = torch.ones(D)
-    sidecar_query_aligned[0, 0, 1] = -torch.ones(D)
-    sidecar_query_aligned[0, 0, 2] = -torch.ones(D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_querymatch.zero_()
-    out_no_querymatch, _, _ = layer(local, sidecar_query_aligned, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_querymatch.fill_(8.0)
-    out_with_querymatch, _, _ = layer(local, sidecar_query_aligned, boundary)
-
-    no_querymatch_delta = (out_no_querymatch - local).abs().mean().item()
-    with_querymatch_delta = (out_with_querymatch - local).abs().mean().item()
-    assert with_querymatch_delta > no_querymatch_delta + 1e-3
-
-
-def test_gdh_read_queryadv_term_boosts_sidecar_when_it_beats_local_query_match():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(-torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_query_better = torch.zeros(B, N, R, D)
-    sidecar_query_better[0, 0, 0] = -torch.ones(D)
-    sidecar_query_better[0, 0, 1] = torch.ones(D)
-    sidecar_query_better[0, 0, 2] = torch.ones(D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_queryadv.zero_()
-    out_no_queryadv, _, _ = layer(local, sidecar_query_better, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_queryadv.fill_(30.0)
-    out_with_queryadv, _, _ = layer(local, sidecar_query_better, boundary)
-
-    no_queryadv_delta = (out_no_queryadv - local).abs().mean().item()
-    with_queryadv_delta = (out_with_queryadv - local).abs().mean().item()
-    assert with_queryadv_delta > no_queryadv_delta + 1e-3
-
-
-def test_gdh_read_queryadv2_term_rewards_decisive_query_advantage_magnitude():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(-torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_strong_adv = torch.zeros(B, N, R, D)
-    sidecar_strong_adv[0, 0, 0] = -torch.ones(D)
-    sidecar_strong_adv[0, 0, 1] = torch.ones(D)
-    sidecar_strong_adv[0, 0, 2] = torch.ones(D)
-
-    sidecar_mild_adv = torch.zeros(B, N, R, D)
-    sidecar_mild_adv[0, 0, 0] = torch.cat([-torch.ones(D // 2), torch.ones(D // 2)])
-    sidecar_mild_adv[0, 0, 1] = torch.ones(D)
-    sidecar_mild_adv[0, 0, 2] = torch.ones(D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_queryadv2.zero_()
-    out_strong_no_q2, _, _ = layer(local, sidecar_strong_adv, boundary)
-    out_mild_no_q2, _, _ = layer(local, sidecar_mild_adv, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_queryadv2.fill_(20.0)
-    out_strong_q2, _, _ = layer(local, sidecar_strong_adv, boundary)
-    out_mild_q2, _, _ = layer(local, sidecar_mild_adv, boundary)
-
-    strong_no_q2 = (out_strong_no_q2 - local).abs().mean().item()
-    mild_no_q2 = (out_mild_no_q2 - local).abs().mean().item()
-    strong_q2 = (out_strong_q2 - local).abs().mean().item()
-    mild_q2 = (out_mild_q2 - local).abs().mean().item()
-
-    baseline_gap = strong_no_q2 - mild_no_q2
-    with_q2_gap = strong_q2 - mild_q2
-    assert with_q2_gap > baseline_gap + 1e-3
-
-
-@pytest.mark.skip(reason="pruned read-gate experimental terms")
-def test_gdh_read_queryresid_term_prefers_sidecar_when_local_query_headroom_is_high():
-    B, N, D, R, h = 1, 1, 8, 1, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.diag(torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=torch.float32)))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconf.zero_()
-        layer.read.w_g_advconfnovel.zero_()
-        layer.read.w_g_localquery.zero_()
-        layer.read.w_g_localredundancy.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local_high_headroom = torch.ones(B, N, D)
-    local_low_headroom = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0], dtype=torch.float32).view(B, N, D)
-    sidecar_high_headroom = torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=torch.float32).view(B, N, R, D)
-    sidecar_low_headroom = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0], dtype=torch.float32).view(B, N, R, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_queryresid.zero_()
-    out_high_no_term, _, _ = layer(local_high_headroom, sidecar_high_headroom, boundary)
-    out_low_no_term, _, _ = layer(local_low_headroom, sidecar_low_headroom, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_queryresid.fill_(10.0)
-    out_high_with_term, _, _ = layer(local_high_headroom, sidecar_high_headroom, boundary)
-    out_low_with_term, _, _ = layer(local_low_headroom, sidecar_low_headroom, boundary)
-
-    baseline_gap = (out_high_no_term - local_high_headroom).abs().mean().item() - (out_low_no_term - local_low_headroom).abs().mean().item()
-    with_term_gap = (out_high_with_term - local_high_headroom).abs().mean().item() - (out_low_with_term - local_low_headroom).abs().mean().item()
-    assert with_term_gap > baseline_gap + 1e-3
-
-
-@pytest.mark.skip(reason="pruned read-gate experimental terms")
-def test_gdh_read_localquery_term_strengthens_local_branch_when_query_already_local():
-    B, N, D, R, h = 1, 1, 8, 3, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconf.zero_()
-        layer.read.w_g_localredundancy.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    # Retrieval has weak/negative query match while local strongly matches query.
-    sidecar_not_query_aligned = torch.zeros(B, N, R, D)
-    sidecar_not_query_aligned[0, 0, 0] = -torch.ones(D)
-    sidecar_not_query_aligned[0, 0, 1] = -torch.ones(D)
-    sidecar_not_query_aligned[0, 0, 2] = -torch.ones(D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_localquery.zero_()
-    out_no_localquery, _, _ = layer(local, sidecar_not_query_aligned, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_localquery.fill_(10.0)
-    out_with_localquery, _, _ = layer(local, sidecar_not_query_aligned, boundary)
-
-    no_localquery_delta = (out_no_localquery - local).abs().mean().item()
-    with_localquery_delta = (out_with_localquery - local).abs().mean().item()
-    assert with_localquery_delta < no_localquery_delta - 1e-3
-
-
-@pytest.mark.skip(reason="pruned read-gate experimental terms")
-def test_gdh_read_localredundancy_term_prefers_local_when_sidecar_is_redundant():
-    B, N, D, R, h = 1, 1, 8, 1, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconf.zero_()
-        layer.read.w_g_localquery.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_redundant = torch.ones(B, N, R, D)
-    sidecar_novel = torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=local.dtype).view(1, 1, 1, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_localredundancy.zero_()
-    out_redundant_no_term, _, _ = layer(local, sidecar_redundant, boundary)
-    out_novel_no_term, _, _ = layer(local, sidecar_novel, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_localredundancy.fill_(12.0)
-    out_redundant_with_term, _, _ = layer(local, sidecar_redundant, boundary)
-    out_novel_with_term, _, _ = layer(local, sidecar_novel, boundary)
-
-    baseline_gap = (out_novel_no_term - local).abs().mean().item() - (out_redundant_no_term - local).abs().mean().item()
-    with_term_gap = (out_novel_with_term - local).abs().mean().item() - (out_redundant_with_term - local).abs().mean().item()
-    assert with_term_gap > baseline_gap + 1e-3
-
-
-@pytest.mark.skip(reason="pruned read-gate experimental terms")
-def test_gdh_read_advnovel_term_prefers_novel_query_advantage_over_redundant_match():
-    B, N, D, R, h = 1, 1, 8, 1, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(-torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    sidecar_redundant = -torch.ones(B, N, R, D)  # query-advantage positive but redundant vs local
-    sidecar_novel = torch.tensor([1, 1, 1, 1, -1, -1, -1, -1], dtype=local.dtype).view(1, 1, 1, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconf.zero_()
-    out_redundant_no_term, _, _ = layer(local, sidecar_redundant, boundary)
-    out_novel_no_term, _, _ = layer(local, sidecar_novel, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_advnovel.fill_(12.0)
-    out_redundant_with_term, _, _ = layer(local, sidecar_redundant, boundary)
-    out_novel_with_term, _, _ = layer(local, sidecar_novel, boundary)
-
-    baseline_gap = (out_novel_no_term - local).abs().mean().item() - (out_redundant_no_term - local).abs().mean().item()
-    with_term_gap = (out_novel_with_term - local).abs().mean().item() - (out_redundant_with_term - local).abs().mean().item()
-    assert with_term_gap > baseline_gap + 1e-3
-
-
-@pytest.mark.skip(reason="pruned read-gate experimental terms")
-def test_gdh_read_advconf_term_prefers_confident_query_advantage_over_diffuse_match():
-    B, N, D, R, h = 1, 1, 8, 2, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(-torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconfnovel.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    # Same mean sidecar value in both cases, but different read confidence.
-    sidecar_confident = torch.stack([
-        -torch.ones(D),
-        torch.ones(D),
-    ], dim=0).view(1, 1, R, D)
-    sidecar_diffuse = -torch.ones(B, N, R, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_advconf.zero_()
-    out_conf_no_term, _, _ = layer(local, sidecar_confident, boundary)
-    out_diff_no_term, _, _ = layer(local, sidecar_diffuse, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_advconf.fill_(12.0)
-    out_conf_with_term, _, _ = layer(local, sidecar_confident, boundary)
-    out_diff_with_term, _, _ = layer(local, sidecar_diffuse, boundary)
-
-    baseline_gap = (out_conf_no_term - local).abs().mean().item() - (out_diff_no_term - local).abs().mean().item()
-    with_term_gap = (out_conf_with_term - local).abs().mean().item() - (out_diff_with_term - local).abs().mean().item()
-    assert with_term_gap > baseline_gap + 1e-3
-
-
-@pytest.mark.skip(reason="pruned read-gate experimental terms")
-def test_gdh_read_advconfnovel_term_prefers_confident_novel_query_advantage():
-    B, N, D, R, h = 1, 1, 8, 2, 2
-    cfg = GDHConfig(n_embd=D, n_slots=R, n_write_heads=h)
-    layer = GDHLayer(cfg)
-
-    with torch.no_grad():
-        layer.read.W_q_read.copy_(-torch.eye(D))
-        layer.read.W_k_read_global.copy_(torch.eye(D))
-        layer.read.W_v_read_global.copy_(torch.eye(D))
-        layer.read.W_o_read.copy_(torch.eye(D))
-        layer.read.W_g_read.zero_()
-        layer.read.W_g_side.zero_()
-        layer.read.w_g_interaction.zero_()
-        layer.read.w_g_confidence.zero_()
-        layer.read.w_g_novelty.zero_()
-        layer.read.w_g_temp.zero_()
-        layer.read.w_g_synergy.zero_()
-        layer.read.w_g_querymatch.zero_()
-        layer.read.w_g_queryadv.zero_()
-        layer.read.w_g_advnovel.zero_()
-        layer.read.w_g_advconf.zero_()
-
-        layer.process.W_self_q.zero_(); layer.process.W_self_k.zero_(); layer.process.W_self_v.zero_(); layer.process.W_self_o.zero_()
-        layer.process.W_mlp_in.zero_(); layer.process.W_mlp_out.zero_()
-        layer.write.W_q_slots_global.zero_(); layer.write.W_v_write.zero_(); layer.write.W_k_write.zero_(); layer.write.W_o_write.zero_()
-
-    local = torch.ones(B, N, D)
-    # Confident + novel + query-advantage-positive.
-    sidecar_confident_novel = torch.stack([
-        torch.tensor([-1, -1, -1, -1, 1, 1, 1, 1], dtype=local.dtype),
-        torch.ones(D),
-    ], dim=0).view(1, 1, R, D)
-    # Confident + redundant + query-advantage-positive.
-    sidecar_confident_redundant = torch.stack([
-        -torch.ones(D),
-        torch.ones(D),
-    ], dim=0).view(1, 1, R, D)
-    boundary = torch.zeros(B, N, dtype=torch.bool)
-
-    with torch.no_grad():
-        layer.read.w_g_advconfnovel.zero_()
-    out_novel_no_term, _, _ = layer(local, sidecar_confident_novel, boundary)
-    out_redundant_no_term, _, _ = layer(local, sidecar_confident_redundant, boundary)
-
-    with torch.no_grad():
-        layer.read.w_g_advconfnovel.fill_(12.0)
-    out_novel_with_term, _, _ = layer(local, sidecar_confident_novel, boundary)
-    out_redundant_with_term, _, _ = layer(local, sidecar_confident_redundant, boundary)
-
-    baseline_gap = (out_novel_no_term - local).abs().mean().item() - (out_redundant_no_term - local).abs().mean().item()
-    with_term_gap = (out_novel_with_term - local).abs().mean().item() - (out_redundant_with_term - local).abs().mean().item()
-    assert with_term_gap > baseline_gap + 1e-3
 
 
 def test_cosine_gate_projection_is_scale_invariant():
@@ -1365,7 +656,24 @@ def _tiny_gpt_config(*, arch: str, n_layer: int = 1):
         arch=arch,
         gdh_slots=3,
         gdh_write_heads=4,
+        gdh_bos_token_id=1,
     )
+
+
+def _segmented_scan_reference(delta, beta, boundary):
+    """Reference segmented scan with hard resets on boundary starts."""
+    out = torch.empty_like(delta)
+    state = torch.zeros_like(delta[:, 0])
+    for t in range(delta.shape[1]):
+        state = torch.where(boundary[:, t].view(-1, 1, 1), torch.zeros_like(state), state)
+        if beta <= 0.0:
+            state = delta[:, t]
+        elif beta >= 1.0:
+            state = state + delta[:, t]
+        else:
+            state = state * beta + delta[:, t]
+        out[:, t] = state
+    return out
 
 
 def test_gpt_gdh_forward_runs_no_kvcache():
@@ -1381,12 +689,10 @@ def test_gpt_gdh_forward_runs_no_kvcache():
 
 def test_gpt_gdh_can_disable_read_gate():
     cfg = _tiny_gpt_config(arch="gdh")
-    cfg.gdh_use_read_gate = False
     model = GPT(cfg)
     model.init_weights()
 
-    assert all(not read_core.use_read_gate for read_core in model.gdh_read)
-
+    # Legacy read-competition gate is removed in V2; disabling it should remain a safe no-op.
     idx = torch.randint(0, cfg.vocab_size, (2, 6), dtype=torch.long)
     logits = model(idx)
     assert logits.shape == (2, 6, cfg.vocab_size)
@@ -1407,6 +713,101 @@ def test_gpt_gdh_can_disable_write_brain():
     logits = model(idx)
     assert logits.shape == (2, 6, cfg.vocab_size)
     assert torch.isfinite(logits).all()
+
+
+def test_gpt_gdh_segmented_scan_single_bos_matches_reference():
+    cfg = _tiny_gpt_config(arch="gdh")
+    model = GPT(cfg)
+
+    delta = torch.arange(1, 1 + 1 * 6 * 3 * 2, dtype=torch.float32).view(1, 6, 3, 2)
+    boundary = torch.tensor([[1, 0, 0, 0, 0, 0]], dtype=torch.bool)
+
+    got = model._gdh_scan_accumulate(delta, beta=1.0, boundary_mask=boundary)
+    ref = _segmented_scan_reference(delta, beta=1.0, boundary=boundary)
+
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-6)
+
+
+def test_gpt_gdh_segmented_scan_multiple_bos_matches_reference():
+    cfg = _tiny_gpt_config(arch="gdh")
+    model = GPT(cfg)
+
+    torch.manual_seed(123)
+    delta = torch.randn(2, 7, 3, 4)
+    boundary = torch.tensor(
+        [
+            [1, 0, 0, 1, 0, 0, 1],
+            [1, 0, 1, 0, 0, 1, 0],
+        ],
+        dtype=torch.bool,
+    )
+
+    got = model._gdh_scan_accumulate(delta, beta=1.0, boundary_mask=boundary)
+    ref = _segmented_scan_reference(delta, beta=1.0, boundary=boundary)
+
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-6)
+
+
+def test_gpt_gdh_segmented_scan_multiple_bos_leaky_beta_matches_reference():
+    cfg = _tiny_gpt_config(arch="gdh")
+    model = GPT(cfg)
+
+    torch.manual_seed(123)
+    delta = torch.randn(2, 7, 3, 4)
+    boundary = torch.tensor(
+        [
+            [1, 0, 0, 1, 0, 0, 1],
+            [1, 0, 1, 0, 0, 1, 0],
+        ],
+        dtype=torch.bool,
+    )
+
+    got = model._gdh_scan_accumulate(delta, beta=0.9, boundary_mask=boundary)
+    ref = _segmented_scan_reference(delta, beta=0.9, boundary=boundary)
+
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-6)
+
+
+def test_gpt_gdh_state_carry_changes_outputs_when_no_bos_start():
+    torch.manual_seed(123)
+    cfg = _tiny_gpt_config(arch="gdh", n_layer=2)
+    model = GPT(cfg)
+    model.init_weights()
+    # Read mixer is zero-init by contract; warm it so read path can express carry influence.
+    with torch.no_grad():
+        for i in range(cfg.n_layer):
+            model.gdh_read[i].W_o_read.normal_(mean=0.0, std=0.02)
+
+    # No BOS at position 0 => carry should influence this chunk.
+    idx = torch.randint(2, cfg.vocab_size, (2, 6), dtype=torch.long)
+
+    logits_no, state_no = model(idx, return_gdh_state=True)
+    carry = torch.randn(2, cfg.gdh_slots, cfg.n_embd)
+    logits_carry, state_carry = model(idx, gdh_state_in=carry, return_gdh_state=True)
+
+    assert logits_no.shape == logits_carry.shape == (2, 6, cfg.vocab_size)
+    assert state_no.shape == state_carry.shape == (2, cfg.gdh_slots, cfg.n_embd)
+    assert not torch.allclose(logits_no, logits_carry)
+
+
+def test_gpt_gdh_state_carry_ignored_when_bos_at_start():
+    torch.manual_seed(123)
+    cfg = _tiny_gpt_config(arch="gdh", n_layer=2)
+    model = GPT(cfg)
+    model.init_weights()
+    with torch.no_grad():
+        for i in range(cfg.n_layer):
+            model.gdh_read[i].W_o_read.normal_(mean=0.0, std=0.02)
+
+    # BOS at position 0 => segmented scan resets and should nullify carry influence.
+    idx = torch.randint(2, cfg.vocab_size, (2, 6), dtype=torch.long)
+    idx[:, 0] = cfg.gdh_bos_token_id
+
+    logits_no, _ = model(idx, return_gdh_state=True)
+    carry = torch.randn(2, cfg.gdh_slots, cfg.n_embd)
+    logits_carry, _ = model(idx, gdh_state_in=carry, return_gdh_state=True)
+
+    assert torch.allclose(logits_no, logits_carry, atol=1e-6, rtol=1e-6)
 
 
 def test_gpt_gdh_noop_mixers_match_baseline_output():
@@ -1436,18 +837,18 @@ def test_gpt_gdh_noop_mixers_match_baseline_output():
     assert torch.allclose(logits_base, logits_gdh, atol=1e-6, rtol=1e-6)
 
 
-def test_gpt_gdh_option1_init_bootstrap_contract():
+def test_gpt_gdh_init_contract_v23_rezero_output_mixers():
     cfg = _tiny_gpt_config(arch="gdh", n_layer=2)
     model = GPT(cfg)
     model.init_weights()
 
     with torch.no_grad():
         for i in range(cfg.n_layer):
-            # Option-1 contract: read mixer starts at 0, write mixer starts non-zero.
+            # v2.3 contract: outward read coupling starts at zero, internal write path stays alive.
             assert torch.count_nonzero(model.gdh_read[i].W_o_read).item() == 0
             assert torch.count_nonzero(model.gdh_write[i].W_o_write).item() > 0
 
-        # Write-side global brain starts as near-noop residual (safe bootstrap)
+        # Write-brain in-proj active, out-proj ReZero.
         assert torch.count_nonzero(model.gdh_write[0].W_write_mlp_in_global).item() > 0
         assert torch.count_nonzero(model.gdh_write[0].W_write_mlp_out_global).item() == 0
 
@@ -1514,7 +915,11 @@ def test_gpt_gdh_global_weight_count_not_multiplied_by_layers():
     gdh_2 = m2.num_scaling_params()["gdh_matrices"]
 
     d = cfg1.n_embd
-    local_per_layer = (2 * d * d + 2 * d + 15) + (3 * d * d)  # read-local (+sidecar gate logit + interaction+confidence+novelty+temperature+queryadv-temperature+synergy+querymatch+queryadv+queryadv2+advnovel+advconf+queryresid+advconfnovel+localquery+localredundancy scalars) + write-local
+    # V2.1 local-per-layer GDH params:
+    # read-local: W_q_read (d*d) + W_o_read (d*d) + W_g_read_mute (d*1) + b_g_read_mute (1)
+    # write-local: W_k_write/W_v_write/W_o_write (3*d*d)
+    # write-gate local (slot-wise): Linear(d -> R) with bias => d*R + R
+    local_per_layer = (2 * d * d + d + 1) + (3 * d * d) + (d * cfg1.gdh_slots + cfg1.gdh_slots)
     assert gdh_2 - gdh_1 == local_per_layer
 
 

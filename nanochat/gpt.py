@@ -47,15 +47,13 @@ class GPTConfig:
     # GDH knobs (used when arch == "gdh")
     gdh_slots: int = 16
     gdh_write_heads: int = -1  # -1 means use n_head
-    gdh_use_read_gate: bool = True
     gdh_use_write_brain: bool = True
     gdh_write_brain_hidden_mult: int = 4
-    # Probe-parity knobs (default off/no-op to preserve prior behavior)
+    # Probe-parity knobs
     gdh_route_topk: int = 0
     gdh_scan_beta: float = 1.0
-    gdh_use_ema_scan: bool = False
     gdh_usage_balance_lambda: float = 0.0
-    gdh_use_write_gate: bool = False
+    gdh_use_write_gate: bool = True
     gdh_write_gate_bias: float = -2.0
     gdh_probe_warmstart_read_mixer: bool = False
     # BOS-aware sidecar hygiene
@@ -209,7 +207,7 @@ class GPT(nn.Module):
             raise ValueError(f"Unknown arch: {config.arch}. Use baseline or gdh.")
         if self.arch == "gdh":
             self.gdh_read = nn.ModuleList([
-                GDHReadCore(config.n_embd, use_read_gate=config.gdh_use_read_gate)
+                GDHReadCore(config.n_embd, use_read_mute_gate=True)
                 for _ in range(config.n_layer)
             ])
             self.gdh_write = nn.ModuleList([
@@ -222,7 +220,7 @@ class GPT(nn.Module):
                 for _ in range(config.n_layer)
             ])
             self.gdh_write_gate = nn.ModuleList([
-                nn.Linear(config.n_embd, 1, bias=True) for _ in range(config.n_layer)
+                nn.Linear(config.n_embd, config.gdh_slots, bias=True) for _ in range(config.n_layer)
             ]) if config.gdh_use_write_gate else None
 
             # Tie the designated global GDH weights across layers.
@@ -331,11 +329,8 @@ class GPT(nn.Module):
         if self.arch == "gdh":
             gdh_std = n_embd**-0.5
             for read_core, write_core in zip(self.gdh_read, self.gdh_write):
-                # Option-1 inter-layer memory bootstrap:
-                # - keep read output mixer zero-init (near-baseline residual behavior)
-                # - keep write output mixer non-zero so sidecar updates can form immediately
-                # This avoids the all-zero Jacobian dead-state from zeroing both mixers.
-                read_core.reset_parameters(std=gdh_std, zero_init_mixer=True)
+                # Init hygiene: keep GDH mixers active from step 1 under short-run/low-LR regimes.
+                read_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
                 write_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
 
             if self.gdh_write_gate is not None:
@@ -522,8 +517,8 @@ class GPT(nn.Module):
         ]
 
         # GDH path is still early-stage; keep it on AdamW to avoid Muon instability on tiny shapes.
-        # Use lower LR for tied/global GDH tensors to reduce high-leverage state blow-ups.
-        gdh_global_lr_mult = 0.25
+        # v2.2: restore full LR for tied/global GDH tensors to avoid sidecar under-learning.
+        gdh_global_lr_mult = 1.0
         if gdh_global_params:
             param_groups.append(dict(
                 kind='adamw', params=gdh_global_params, lr=matrix_lr * gdh_global_lr_mult,
@@ -615,13 +610,15 @@ class GPT(nn.Module):
         start_pos = torch.where(bmask, t_idx, neg_inf)
         # last_start[b, t] = index of the most recent boundary <= t
         last_start, _ = torch.cummax(start_pos, dim=1)
+        # If no boundary has appeared yet in a row, treat token-0 as implicit start.
+        seg_start = torch.where(last_start < 0, torch.zeros_like(last_start), last_start)
 
         # segment-prefix subtraction helper: subtract prefix value at (segment_start - 1)
         def _subtract_segment_prefix(prefix_tensor):
-            prev_idx = (last_start - 1).clamp_min(0)
+            prev_idx = (seg_start - 1).clamp_min(0)
             gather_idx = prev_idx.view(B, T, 1, 1).expand(B, T, prefix_tensor.size(2), prefix_tensor.size(3))
             prefix_prev = torch.gather(prefix_tensor, dim=1, index=gather_idx)
-            has_prev = (last_start > 0).view(B, T, 1, 1)
+            has_prev = (seg_start > 0).view(B, T, 1, 1)
             return prefix_tensor - torch.where(has_prev, prefix_prev, torch.zeros_like(prefix_prev))
 
         if beta <= 0.0:
@@ -635,7 +632,7 @@ class GPT(nn.Module):
         # Leaky segmented scan (vectorized):
         # y_t = beta^k * sum_{j=0..k} delta_{s+j} * beta^{-j}, where k is position within segment.
         # local_pos = t - segment_start
-        local_pos = (t_idx - last_start).to(torch.float64)
+        local_pos = (t_idx - seg_start).to(torch.float64)
         beta_t = torch.tensor(float(beta), device=delta.device, dtype=torch.float64)
         beta_pow = torch.pow(beta_t, local_pos).view(B, T, 1, 1)
         beta_inv_pow = torch.pow(beta_t, -local_pos).view(B, T, 1, 1)
@@ -654,7 +651,7 @@ class GPT(nn.Module):
 
         x_write = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
         k_upd = torch.matmul(x_write, write_core.W_k_write)
-        v_upd = torch.tanh(torch.matmul(x_write, write_core.W_v_write))
+        v_upd = torch.matmul(x_write, write_core.W_v_write)
 
         e_slots = write_core.E_slots * torch.rsqrt(write_core.E_slots.pow(2).mean(dim=-1, keepdim=True) + eps)
         q_slots = torch.matmul(e_slots, write_core.W_q_slots_global)
@@ -681,8 +678,11 @@ class GPT(nn.Module):
 
         g_write = None
         if gate_proj is not None:
-            g_write = torch.sigmoid(gate_proj(x_write)).unsqueeze(-2)
-            delta = delta * g_write
+            gate_raw = gate_proj(x_write)  # [B,N,R]
+            gate_sig = torch.sigmoid(gate_raw)
+            if gate_sig.shape[-1] != r:
+                raise ValueError(f"Unexpected gdh write-gate width: {gate_sig.shape[-1]} (expected {r})")
+            g_write = gate_sig.unsqueeze(-1)  # [B,N,R,1]
 
         return delta, alpha_soft, g_write
 
@@ -743,29 +743,27 @@ class GPT(nn.Module):
                     gate_proj=gate_proj,
                     eps=1e-6,
                 )
-                # Final hard bound before temporal accumulation.
+                # v2.4: remove pre-tanh RMSNorm; keep raw signed write dynamics.
                 delta = torch.tanh(delta)
 
                 if self.config.gdh_usage_balance_lambda > 0.0:
-                    gate_weight = g_write.detach() if g_write is not None else torch.ones_like(alpha_soft[..., :1, :1])
+                    if g_write is not None:
+                        # g_write: [B,N,R,1] -> [B,N,1,R]
+                        gate_weight = g_write.detach().squeeze(-1).unsqueeze(-2)
+                    else:
+                        gate_weight = torch.ones_like(alpha_soft[..., :1, :1])
                     weighted_sum = (alpha_soft * gate_weight).sum(dim=(0, 1, 2))
                     total_weight = gate_weight.sum() * gdh_heads
                     usage = weighted_sum / (total_weight + 1e-9)
                     usage_target = torch.full_like(usage, 1.0 / usage.shape[0])
                     usage_losses.append((usage - usage_target).pow(2).mean())
 
-                if self.config.gdh_use_ema_scan and g_write is not None:
-                    sidecar = self._gdh_scan_accumulate_ema(
-                        delta,
-                        retention=g_write,
-                        boundary_mask=gdh_boundary_mask,
-                    )
-                else:
-                    sidecar = sidecar + self._gdh_scan_accumulate(
-                        delta,
-                        beta=self.config.gdh_scan_beta,
-                        boundary_mask=gdh_boundary_mask,
-                    )
+                assert g_write is not None, "Canonical GDH requires slot-wise write retention gate in EMA scan"
+                sidecar = self._gdh_scan_accumulate_ema(
+                    delta,
+                    retention=g_write,
+                    boundary_mask=gdh_boundary_mask,
+                )
 
         x = norm(x)
 

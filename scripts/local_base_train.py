@@ -62,14 +62,15 @@ parser.add_argument("--arch", type=str, default="baseline", choices=["baseline",
 parser.add_argument("--no-value-embeds", action="store_true", help="disable ResFormer-style value embeddings")
 parser.add_argument("--gdh-slots", type=int, default=16, help="number of GDH sidecar slots (used when --arch gdh)")
 parser.add_argument("--gdh-write-heads", type=int, default=-1, help="GDH write heads (-1 = use n_head)")
-parser.add_argument("--gdh-no-read-gate", action="store_true", help="disable GDH read gate (always-on sidecar read path)")
+# --gdh-no-read-gate removed: legacy read-competition gate path no longer exists.
 parser.add_argument("--gdh-no-write-brain", action="store_true", help="disable GDH write-space residual brain (Linear->ReLU²->Linear)")
 parser.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4, help="GDH write-brain hidden width multiplier (hidden = mult * D)")
 parser.add_argument("--gdh-route-topk", type=int, default=0, help="GDH sparse top-k write routing (0 = dense)")
 parser.add_argument("--gdh-scan-beta", type=float, default=1.0, help="GDH temporal scan beta (1.0 = cumsum)")
-parser.add_argument("--gdh-use-ema-scan", action="store_true", help="use GDH EMA scan S_t = g*S_{t-1} + (1-g)*delta_t with write-gate retention")
+# EMA scan is canonical in current GDH path (no flag).
 parser.add_argument("--gdh-usage-balance-lambda", type=float, default=0.0, help="GDH usage-balance auxiliary loss coefficient")
-parser.add_argument("--gdh-use-write-gate", action="store_true", help="enable GDH write gate (per-layer Linear(D->1), sigmoid)")
+parser.add_argument("--gdh-use-write-gate", action="store_true", help="enable GDH write gate (per-layer Linear(D->R) slot-wise by default)")
+# Slot-wise write gate and read-mute gate are canonical in current GDH path.
 parser.add_argument("--gdh-write-gate-bias", type=float, default=-2.0, help="initial bias for GDH write gate projections")
 parser.add_argument("--gdh-probe-warmstart-read-mixer", action="store_true", help="warm-start first two GDH read output mixers (probe parity)")
 parser.add_argument("--gate-log-every", type=int, default=10, help="log GDH gate telemetry every N steps (-1 = disable)")
@@ -200,15 +201,17 @@ def build_model_meta(depth):
         arch=args.arch,
         gdh_slots=args.gdh_slots,
         gdh_write_heads=args.gdh_write_heads,
-        gdh_use_read_gate=not args.gdh_no_read_gate,
+        # gdh_use_read_gate removed (legacy competition-gate path deleted)
         gdh_use_write_brain=not args.gdh_no_write_brain,
         gdh_write_brain_hidden_mult=args.gdh_write_brain_hidden_mult,
         gdh_route_topk=args.gdh_route_topk,
         gdh_scan_beta=args.gdh_scan_beta,
-        gdh_use_ema_scan=args.gdh_use_ema_scan,
+        # gdh_use_ema_scan removed (EMA is canonical)
         gdh_usage_balance_lambda=args.gdh_usage_balance_lambda,
         gdh_use_write_gate=args.gdh_use_write_gate,
+        # gdh_write_gate_per_slot removed (slot-wise gate is canonical)
         gdh_write_gate_bias=args.gdh_write_gate_bias,
+        # gdh_use_read_mute_gate removed (read-mute gate is canonical)
         gdh_probe_warmstart_read_mixer=args.gdh_probe_warmstart_read_mixer,
         gdh_bos_token_id=tokenizer.get_bos_token_id(),
         use_value_embeds=not args.no_value_embeds,
@@ -559,15 +562,32 @@ def collect_gdh_probe_telemetry(
 
             telemetry = {}
             gate_means, gate_stds, gate_open_fracs = [], [], []
+            read_mute_means, read_mute_stds, read_mute_open_fracs = [], [], []
             out_means, out_abs_means, out_stds = [], [], []
             delta_abs_means = []
-            use_read_gate = bool(getattr(m.config, "gdh_use_read_gate", True))
             use_write_brain = bool(getattr(m.config, "gdh_use_write_brain", True))
+            use_ema_scan = True
 
             for i, block in enumerate(m.transformer.h):
                 x = m.resid_lambdas[i] * x + m.x0_lambdas[i] * x0
 
                 ve = m.value_embeds[str(i)](idx_tokens) if str(i) in m.value_embeds else None
+
+                # Read-mute telemetry (if enabled): gate on sidecar read injection.
+                read_core = m.gdh_read[i]
+                if bool(getattr(read_core, "use_read_mute_gate", False)):
+                    x_read_probe = gpt_norm(x)
+                    read_mute = (0.05 + 0.95 * torch.sigmoid(torch.matmul(x_read_probe, read_core.W_g_read_mute) + read_core.b_g_read_mute)).squeeze(-1).float()
+                    rm_mean = read_mute.mean().item()
+                    rm_std = read_mute.std(unbiased=False).item()
+                    rm_open = (read_mute > open_threshold).float().mean().item()
+                    read_mute_means.append(rm_mean)
+                    read_mute_stds.append(rm_std)
+                    read_mute_open_fracs.append(rm_open)
+                    telemetry[f"gdh/layer_{i}/read_mute_mean"] = rm_mean
+                    telemetry[f"gdh/layer_{i}/read_mute_std"] = rm_std
+                    telemetry[f"gdh/layer_{i}/read_mute_open_frac"] = rm_open
+
                 x = m.gdh_read[i].forward_sequence(x, sidecar, eps=1e-6)
                 x = block(x, ve, cos_sin, m.window_sizes[i], kv_cache=None)
 
@@ -582,7 +602,10 @@ def collect_gdh_probe_telemetry(
                 )
 
                 if g_write is not None:
-                    g = g_write.squeeze(-1).squeeze(-1).float()
+                    # g_write can be [B,N,1,1] (scalar gate) or [B,N,R,1] (slot-wise gate).
+                    g = g_write.squeeze(-1).float()
+                    if g.ndim == 3:
+                        g = g.mean(dim=-1)
                 else:
                     g = torch.ones(bsz, n_tokens, device=x.device, dtype=torch.float32)
 
@@ -593,19 +616,14 @@ def collect_gdh_probe_telemetry(
                 gate_stds.append(gate_std)
                 gate_open_fracs.append(gate_open)
 
+                # v2.4 telemetry mirror: no pre-tanh RMSNorm on write delta.
                 delta = torch.tanh(delta)
-                if bool(getattr(m.config, "gdh_use_ema_scan", False)) and g_write is not None:
-                    sidecar = m._gdh_scan_accumulate_ema(
-                        delta,
-                        retention=g_write,
-                        boundary_mask=gdh_boundary_mask,
-                    )
-                else:
-                    sidecar = sidecar + m._gdh_scan_accumulate(
-                        delta,
-                        beta=float(getattr(m.config, "gdh_scan_beta", 1.0)),
-                        boundary_mask=gdh_boundary_mask,
-                    )
+                assert g_write is not None, "Canonical GDH requires slot-wise write retention gate in EMA scan"
+                sidecar = m._gdh_scan_accumulate_ema(
+                    delta,
+                    retention=g_write,
+                    boundary_mask=gdh_boundary_mask,
+                )
 
                 delta_f = delta.float()
                 sidecar_f = sidecar.float()
@@ -620,9 +638,15 @@ def collect_gdh_probe_telemetry(
                 out_stds.append(out_std)
                 delta_abs_means.append(delta_abs_mean)
 
-                telemetry[f"gdh/layer_{i}/write_gate_mean"] = gate_mean
-                telemetry[f"gdh/layer_{i}/write_gate_std"] = gate_std
-                telemetry[f"gdh/layer_{i}/write_gate_open_frac"] = gate_open
+                if use_ema_scan:
+                    # In EMA mode this gate is retention g, not direct write fraction.
+                    telemetry[f"gdh/layer_{i}/retention_gate_mean"] = gate_mean
+                    telemetry[f"gdh/layer_{i}/retention_gate_std"] = gate_std
+                    telemetry[f"gdh/layer_{i}/retention_gate_open_frac"] = gate_open
+                else:
+                    telemetry[f"gdh/layer_{i}/write_gate_mean"] = gate_mean
+                    telemetry[f"gdh/layer_{i}/write_gate_std"] = gate_std
+                    telemetry[f"gdh/layer_{i}/write_gate_open_frac"] = gate_open
 
                 telemetry[f"gdh/layer_{i}/out_state_mean"] = out_mean
                 telemetry[f"gdh/layer_{i}/out_state_abs_mean"] = out_abs_mean
@@ -710,17 +734,26 @@ def collect_gdh_probe_telemetry(
                 telemetry["gdh/global/W_write_mlp_out_tied"] = float(write_mlp_out_tied)
 
     telemetry.update({
-        "gdh/use_read_gate": float(use_read_gate),
         "gdh/use_write_brain": float(use_write_brain),
+        "gdh/use_ema_scan": float(use_ema_scan),
         "gdh/write_brain_hidden_mult": float(getattr(m.config, "gdh_write_brain_hidden_mult", 0)),
-        "gdh/write_gate_mean": sum(gate_means) / len(gate_means),
-        "gdh/write_gate_std": sum(gate_stds) / len(gate_stds),
-        "gdh/write_gate_open_frac": sum(gate_open_fracs) / len(gate_open_fracs),
         "gdh/out_state_mean": sum(out_means) / len(out_means),
         "gdh/out_state_abs_mean": sum(out_abs_means) / len(out_abs_means),
         "gdh/out_state_std": sum(out_stds) / len(out_stds),
         "gdh/delta_abs_mean": sum(delta_abs_means) / len(delta_abs_means),
     })
+    if use_ema_scan:
+        telemetry["gdh/retention_gate_mean"] = sum(gate_means) / len(gate_means)
+        telemetry["gdh/retention_gate_std"] = sum(gate_stds) / len(gate_stds)
+        telemetry["gdh/retention_gate_open_frac"] = sum(gate_open_fracs) / len(gate_open_fracs)
+    else:
+        telemetry["gdh/write_gate_mean"] = sum(gate_means) / len(gate_means)
+        telemetry["gdh/write_gate_std"] = sum(gate_stds) / len(gate_stds)
+        telemetry["gdh/write_gate_open_frac"] = sum(gate_open_fracs) / len(gate_open_fracs)
+    if read_mute_means:
+        telemetry["gdh/read_mute_mean"] = sum(read_mute_means) / len(read_mute_means)
+        telemetry["gdh/read_mute_std"] = sum(read_mute_stds) / len(read_mute_stds)
+        telemetry["gdh/read_mute_open_frac"] = sum(read_mute_open_fracs) / len(read_mute_open_fracs)
     return telemetry
 
 
@@ -872,12 +905,8 @@ while True:
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         if use_gdh_recurrent_carry:
-            # Legacy carry decay (0.85) for additive scan. For EMA scan, recurrence already applies
-            # per-token retention and bounded updates, so keep carry unscaled.
-            if bool(getattr(model.config, "gdh_use_ema_scan", False)):
-                gdh_state_carry = gdh_state_next.detach()
-            else:
-                gdh_state_carry = gdh_state_next.detach() * 0.85
+            # Canonical EMA scan: per-token retention already controls carry dynamics.
+            gdh_state_carry = gdh_state_next.detach()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -940,9 +969,9 @@ while True:
         if gdh_probe_telemetry:
             if gate_log_due:
                 print0(
-                    f"gdh write_gate | mean: {gdh_probe_telemetry['gdh/write_gate_mean']:.4f} | "
-                    f"std: {gdh_probe_telemetry['gdh/write_gate_std']:.4f} | "
-                    f"open>{args.gate_open_threshold:.2f}: {gdh_probe_telemetry['gdh/write_gate_open_frac']:.3f}"
+                    f"gdh retention_gate | mean: {gdh_probe_telemetry['gdh/retention_gate_mean']:.4f} | "
+                    f"std: {gdh_probe_telemetry['gdh/retention_gate_std']:.4f} | "
+                    f"open>{args.gate_open_threshold:.2f}: {gdh_probe_telemetry['gdh/retention_gate_open_frac']:.3f}"
                 )
             print0(
                 f"gdh out_state | mean: {gdh_probe_telemetry['gdh/out_state_mean']:.6f} | "

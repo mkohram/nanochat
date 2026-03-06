@@ -168,10 +168,17 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, use_kv_cache=True):
+        """Generate token columns for a batch of sampled continuations.
+
+        By default this uses KV cache prefill+decode for speed. If the model path
+        does not support kv_cache (e.g. some experimental arches), set
+        use_kv_cache=False to fall back to full-sequence forward passes.
+        """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
+        if isinstance(device, str):
+            device = torch.device(device)
         # NOTE: setting the dtype here and in this way is an ugly hack.
         # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
         # We need to know the dtype here to call __init__ on KVCache and pre-allocate its tensors.
@@ -191,31 +198,41 @@ class Engine:
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
-        # 1) Run a batch 1 prefill of the prompt tokens
+        # 1) Prompt forward pass (with optional KV prefill)
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        kv_cache_decode = None
 
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
+        if use_kv_cache:
+            try:
+                kv_cache_prefill = KVCache(
+                    batch_size=1,
+                    seq_len=len(tokens),
+                    device=device,
+                    dtype=dtype,
+                    **kv_model_kwargs,
+                )
+                logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+                logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+
+                # 2) Replicate the KV cache for each sample/row
+                kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+                kv_cache_decode = KVCache(
+                    batch_size=num_samples,
+                    seq_len=kv_length_hint,
+                    device=device,
+                    dtype=dtype,
+                    **kv_model_kwargs,
+                )
+                kv_cache_decode.prefill(kv_cache_prefill)
+                del kv_cache_prefill  # no need to keep this memory around
+            except NotImplementedError:
+                # Some architectures (e.g. GDH currently) do not implement kv_cache.
+                use_kv_cache = False
+                logits = self.model.forward(ids)[:, -1, :].expand(num_samples, -1)
+        else:
+            logits = self.model.forward(ids)[:, -1, :].expand(num_samples, -1)
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
@@ -271,8 +288,12 @@ class Engine:
             num_generated += 1
 
             # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            if use_kv_cache:
+                ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            else:
+                ids = torch.tensor([state.current_tokens for state in row_states], dtype=torch.long, device=device)
+                logits = self.model.forward(ids)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

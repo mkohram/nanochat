@@ -18,7 +18,8 @@ class GDHOracleParams:
     W_k_read_global: torch.Tensor     # [D, D]
     W_v_read_global: torch.Tensor     # [D, D]
     W_o_read: torch.Tensor            # [D, D]
-    W_g_read: torch.Tensor            # [D, 1]
+    W_g_read_mute: torch.Tensor       # [D, 1]
+    b_g_read_mute: torch.Tensor       # [1]
 
     # Process (causal toy transformer step)
     W_self_q: torch.Tensor            # [D, D]
@@ -67,7 +68,8 @@ def make_oracle_params(
         W_k_read_global=rand(d, d),
         W_v_read_global=rand(d, d),
         W_o_read=W_o_read,
-        W_g_read=rand(d, 1),
+        W_g_read_mute=rand(d, 1),
+        b_g_read_mute=torch.zeros(1, device=device, dtype=dtype),
         W_self_q=rand(d, d),
         W_self_k=rand(d, d),
         W_self_v=rand(d, d),
@@ -148,8 +150,8 @@ def gdh_oracle_layer(
             alpha_read = torch.softmax(logits_read, dim=0)        # [R]
             z_read = alpha_read @ v_mem                           # [D]
 
-            g_read = torch.sigmoid((x_read @ params.W_g_read).squeeze(-1))  # scalar
-            l_tilde = l_t + g_read * (z_read @ params.W_o_read)   # [D]
+            g_read_mute = 0.05 + 0.95 * torch.sigmoid((x_read @ params.W_g_read_mute + params.b_g_read_mute).squeeze(-1))  # scalar
+            l_tilde = l_t + g_read_mute * (z_read @ params.W_o_read)   # [D]
 
             # ---------------------
             # Phase II: Process (causal)
@@ -227,7 +229,8 @@ class GDHDecomposedOracleParams:
     W_k_read_global: torch.Tensor     # [D, D]
     W_v_read_global: torch.Tensor     # [D, D]
     W_o_read: torch.Tensor            # [D, D]
-    W_g_read: torch.Tensor            # [D, 1]
+    W_g_read_mute: torch.Tensor       # [D, 1]
+    b_g_read_mute: torch.Tensor       # [1]
 
     # Process (toy causal transformer)
     W_self_q: torch.Tensor            # [D, D]
@@ -286,7 +289,8 @@ def make_decomposed_oracle_params(
         W_k_read_global=rand(d, d),
         W_v_read_global=rand(d, d),
         W_o_read=W_o_read,
-        W_g_read=rand(d, 1),
+        W_g_read_mute=rand(d, 1),
+        b_g_read_mute=torch.zeros(1, device=device, dtype=dtype),
         W_self_q=rand(d, d),
         W_self_k=rand(d, d),
         W_self_v=rand(d, d),
@@ -391,8 +395,8 @@ def gdh_oracle_layer_decomposed(
             alpha_read = torch.softmax(logits_read, dim=0)          # [R]
             z_read = alpha_read @ v_mem                             # [D]
 
-            g_read = torch.sigmoid((x_read @ params.W_g_read).squeeze(-1))
-            l_tilde = l_t + g_read * (z_read @ params.W_o_read)
+            g_read_mute = 0.05 + 0.95 * torch.sigmoid((x_read @ params.W_g_read_mute + params.b_g_read_mute).squeeze(-1))
+            l_tilde = l_t + g_read_mute * (z_read @ params.W_o_read)
 
             # ---------------------
             # Phase II: Process (causal)

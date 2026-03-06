@@ -1,6 +1,6 @@
 # GDH Workflow (Local + Completion)
 
-Last updated: 2026-02-23
+Last updated: 2026-02-26
 
 This file combines:
 - local project memory for this machine/repo
@@ -11,11 +11,16 @@ This file combines:
 For stable `scripts/local_base_train.py` runs on this machine:
 
 - `--device-batch-size=1`
-- `--total-batch-size=256`
+- `--total-batch-size=256` (or 224 for seq224 recipes)
 - `--num-iterations=10000` (or as needed)
 - `--core-metric-every=-1`
 - `--eval-every=-1`
 - `--sample-every=-1`
+
+Loader modes:
+- default packed mode: `--loader-mode bos_bestfit`
+- recurrent-doc mode: `--loader-mode recurrent_doc --recurrent-max-chunks-per-doc=5`
+- GDH recurrent carry (optional): `--gdh-recurrent-carry-state`
 
 Why:
 - Larger micro-batches (e.g. `--device-batch-size=32`) OOM on GTX 1060 3GB.
@@ -90,4 +95,5 @@ When reporting completion, include:
 
 - Write routing uses learnable slot addresses (`E_slots`) + global slot query projection (`W_q_slots_global`).
 - Layer-local write translators remain `W_k_write` / `W_v_write` / `W_o_write`.
-- This was adopted to address slot symmetry collapse while preserving sequence-parallel write accumulation.
+- Sidecar accumulation is BOS-aware segmented scan (vectorized), preventing cross-doc bleed while preserving sequence-parallel accumulation.
+- Local training can optionally use recurrent-doc chunking with detached chunk-to-chunk GDH state carry.

@@ -1,6 +1,6 @@
 # GDH (Gated Double Helix) — Current Architecture Spec
 
-Last updated: 2026-02-26
+Last updated: 2026-02-27
 
 This spec reflects the behavior currently implemented in:
 - `nanochat/gpt.py` (mainline GDH path)
@@ -22,12 +22,19 @@ This spec reflects the behavior currently implemented in:
 Mainline GDH knobs (`GPTConfig`):
 - `gdh_slots = R`
 - `gdh_write_heads = h` (or fallback to `n_head`)
-- `gdh_use_read_gate` (bool)
 - `gdh_use_write_brain` (bool)
 - `gdh_write_brain_hidden_mult` (int)
+- `gdh_use_write_gate` (bool; canonical path expects `True`)
+- `gdh_write_gate_bias` (float)
 - `gdh_segmented_scan` (bool; default True)
 - `gdh_bos_token_id` (int; set from tokenizer in local training)
-- `gdh_use_ema_scan` (bool; when True, use write-gate-conditioned EMA scan)
+- `gdh_route_topk`, `gdh_usage_balance_lambda` (probe/research knobs)
+
+Canonical GDH architecture in current code path:
+- read-mute gate on sidecar read injection
+- slot-wise write retention gate (`Linear(D→R)`)
+- EMA state update (no additive-scan branch)
+- pre-tanh RMSNorm + final tanh on write delta
 
 Probe-only knobs (`mqar_scan_beta_probe.py`):
 - `route_topk = K`
@@ -57,15 +64,11 @@ From `GPT._tie_gdh_global_weights()`:
 
 Per layer `i`:
 - Read local:
-  - `W_q_read`, `W_o_read`, `W_g_read`, `W_g_side`
-  - read-gate scalar terms used in current gate logic:
-    - `w_g_interaction`, `w_g_confidence`, `w_g_novelty`,
-    - `w_g_synergy`, `w_g_querymatch`, `w_g_queryadv`, `w_g_queryadv2`,
-    - `w_g_temp`, `w_g_temp_adv`
+  - `W_q_read`, `W_o_read`, `W_g_read_mute`, `b_g_read_mute`
 - Write local:
   - `W_k_write`, `W_v_write`, `W_o_write`
 
-(Additional deprecated `w_g_*` scalars exist for compatibility but are not active in current read-gate math.)
+Legacy read-competition parameters (`W_g_read`, `W_g_side`, and `w_g_*` terms) are removed from the active forward path.
 
 ---
 
@@ -101,15 +104,11 @@ Core retrieval:
 - `α_read = softmax((q·k)/sqrt(D), dim=R)`          (`B×T×R`)
 - `z = Σ_r α_read[r] v[r]`                          (`B×T×D`)
 
-Output fusion:
-- If `gdh_use_read_gate = False`:
-  - `X_read = X + z W_o_read`
-- Else (2-way competition gate):
-  - local logit from `W_g_read`
-  - side logit from `W_g_side` + active scalar terms listed above
-  - adaptive temperature from confidence/query-advantage terms
-  - `g_read = softmax([local_logit, side_logit] / temp)[side]`
-  - `X_read = X + g_read * (z W_o_read)`
+Output fusion (current active path):
+- `z_proj = z W_o_read`
+- `g_read_mute = sigmoid(x_read W_g_read_mute + b_g_read_mute)`
+- `z_proj = g_read_mute * z_proj`
+- `X_read = X + z_proj`
 
 ---
 
@@ -126,7 +125,7 @@ Output fusion:
 From `X_proc`:
 - `x_write = RMSNorm(X_proc)`
 - `k_upd = x_write W_k_write`                       (`B×T×D`)
-- `v_upd = tanh(x_write W_v_write)`                 (`B×T×D`, bounded write-value throttle)
+- `v_upd = x_write W_v_write`                       (`B×T×D`)
 
 Slot queries:
 - `q_slots = RMSNorm(E_slots) W_q_slots_global`     (`R×D`)
@@ -140,23 +139,38 @@ Multi-head routing (per head width `d_h`):
 Optional write-brain (if enabled):
 - `Δ ← Δ + MLP(RMSNorm(Δ))`, with `Linear → ReLU² → Linear`
 
-Mainline temporal update:
-- Additive mode (default):
-  - `S ← S_prev + SegmentedScan(Δ, boundary_mask=(idx==gdh_bos_token_id), beta=gdh_scan_beta)`
-- EMA mode (`gdh_use_ema_scan=True`, requires write gate):
-  - `S_t ← g_t * S_{t-1} + (1 - g_t) * Δ_t`, with `g_t = sigmoid(write_gate_t)`
-  - implemented as vectorized segmented EMA scan (parallel tensor ops).
+Write gate (`gdh_use_write_gate=True`):
+- slot-wise retention gate: `g = sigmoid(Linear(D→R)(x_write))`
+- retention tensor shape in forward: `[B,T,R,1]`
+- in canonical EMA path, `g` is retention (do **not** pre-scale `Δ` by `g`).
+
+Final bound before temporal accumulation (always in canonical path):
+- `Δ ← RMSNorm(Δ)`
+- `Δ ← tanh(Δ)`
+- (single hard bound point; no earlier tanh in `v_upd` path)
+
+Mainline temporal update (canonical):
+- `S_t ← g_t * S_{t-1} + (1 - g_t) * Δ_t`, with `g_t = sigmoid(write_gate_t)`
+- implementation uses associative affine-prefix scan (vectorized, sequence-parallel, boundary-aware).
+- if no boundary appears yet, token-0 is treated as implicit segment start for stable segmented math.
 
 ---
 
 ## 7) Initialization facts (as implemented)
 
-- `E_slots ~ N(0, 1)`
-- Read mixer `W_o_read` is zero-init at model init (Option-1 bootstrap)
-- Write mixer `W_o_write` is non-zero init (allows early sidecar writes)
+- GDH base scale: `gdh_std = D^-0.5` (mainline init path).
+- `E_slots ~ N(0, gdh_std)`
+- Read mixer `W_o_read` is non-zero init (`N(0, gdh_std)`).
+- Write mixer `W_o_write` is non-zero init (`N(0, gdh_std)`).
 - If write-brain enabled:
-  - `W_write_mlp_in_global` normal init
-  - `W_write_mlp_out_global` zero-init (safe residual bootstrap)
+  - `W_write_mlp_in_global ~ N(0, gdh_std)`
+  - `W_write_mlp_out_global ~ N(0, gdh_std)`
+- Read mute gate init:
+  - `W_g_read_mute = 0`
+  - `b_g_read_mute = -1.0`
+- Write gate init:
+  - weights `~ N(0, 0.02)`
+  - bias from `gdh_write_gate_bias` (run-config controlled).
 
 ---
 
@@ -166,7 +180,6 @@ In `experiments/mqar_scan_beta_probe.py`:
 
 1. **Probe GDH config forcing + read warm-start**
    - In `_build_model`, probe currently hard-sets `gdh_use_write_brain=True` and `gdh_write_brain_hidden_mult=4`.
-   - `gdh_use_read_gate` is passed through from CLI (`--gdh-use-read-gate`).
    - After `model.init_weights()`, the probe re-initializes `W_o_read` for the first `min(2, n_layer)` GDH read modules with `Normal(0, 0.02)`.
 
 2. **Sparse routing (`route_topk`)**
@@ -220,6 +233,7 @@ When `--gdh-recurrent-carry-state` is enabled (GDH only):
 - model carries sidecar state chunk-to-chunk via `gdh_state_in` / `gdh_state_out`
 - carry is detached each step (TBPTT-style)
 - carry is BOS-aware and does not leak beyond first boundary token in the chunk
+- canonical EMA path keeps carry unscaled at handoff
 
 ## 10) Explicit non-claims (to avoid drift)
 
@@ -227,6 +241,6 @@ The following are **not** current guaranteed mainline behavior:
 - Mandatory Shazeer `P_mean · f_mean` load-balance formula
 - Mandatory no-renorm top-k masking rule
 - Mandatory global-parameter LR scaling by `1/sqrt(L)`
-- Mandatory read-gate bias `-2.0` in core model params
+- Legacy read-competition gate terms (`W_g_read/W_g_side/w_g_*`) in active forward
 
 Those may be explored, but are not the current code contract.

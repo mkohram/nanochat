@@ -41,7 +41,6 @@ def _make_args(**overrides):
         n_embd=32,
         gdh_slots=4,
         gdh_write_heads=2,
-        gdh_use_read_gate=False,
         # probe knobs
         route_topk=2,
         usage_balance_lambda=0.01,
@@ -180,7 +179,7 @@ def _assert_probe_forward_close(out_oracle, out_probe, *, eval_topk: int, vocab_
 
 
 def test_probe_oracle_forward_matches_probe_forward_dense_beta1(probe_mod):
-    args = _make_args(route_topk=0, gdh_use_read_gate=False)
+    args = _make_args(route_topk=0)
     model = probe_mod._build_model(args, device="cpu")
 
     torch.manual_seed(args.seed + 1)
@@ -212,7 +211,7 @@ def test_probe_oracle_forward_matches_probe_forward_dense_beta1(probe_mod):
 
 
 def test_probe_oracle_forward_matches_probe_forward_sparse_leaky(probe_mod):
-    args = _make_args(route_topk=2, gdh_use_read_gate=False)
+    args = _make_args(route_topk=2)
     model = probe_mod._build_model(args, device="cpu")
 
     torch.manual_seed(args.seed + 2)
@@ -244,7 +243,7 @@ def test_probe_oracle_forward_matches_probe_forward_sparse_leaky(probe_mod):
 
 
 def test_probe_oracle_forward_matches_probe_forward_with_read_gate(probe_mod):
-    args = _make_args(route_topk=2, gdh_use_read_gate=True)
+    args = _make_args(route_topk=2)
     model = probe_mod._build_model(args, device="cpu")
 
     torch.manual_seed(args.seed + 3)

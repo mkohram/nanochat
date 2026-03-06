@@ -1,6 +1,6 @@
 # GDH Shared Understanding (Implementation Notes)
 
-Date: 2026-02-18 (updated 2026-02-26)
+Date: 2026-02-18 (updated 2026-02-27)
 
 This file captures the *intent* behind GDH so implementation stays aligned even if formal math is revised.
 
@@ -14,7 +14,7 @@ This file captures the *intent* behind GDH so implementation stays aligned even 
 
 - Each token creates a local query via a layer-specific translator (base + LoRA dialect).
 - Sidecar provides context via global read K/V projections.
-- Retrieved context is gated and injected into local token state.
+- Retrieved context is injected through a simple read-mute gate (`sigmoid`) before residual add.
 
 ## Process intent (Local refinement)
 
@@ -35,7 +35,7 @@ This file captures the *intent* behind GDH so implementation stays aligned even 
 ## Parallel training intent
 
 - Keep write path compatible with parallel training (vectorized segmented-prefix accumulation).
-- No-forget-gate in v1 (additive state); handle stability via normalization + reset policy.
+- Use canonical gated EMA scan (slot-wise retention) while preserving sequence-parallel execution.
 
 ## Reset policy intent (v1)
 
@@ -72,21 +72,25 @@ This file captures the *intent* behind GDH so implementation stays aligned even 
   - `Q_slots = RMSNorm(E_slots) @ W_q_slots_global` (global/shared)
   - `K_upd = x_write @ W_k_write`, `V_upd = x_write @ W_v_write` (layer-local)
 - Read phase still attends to accumulated sidecar state (`S`) via global read K/V.
-- Mainline temporal integration in `nanochat/gpt.py` is now BOS-aware segmented scan:
-  - `sidecar = sidecar + SegmentedScan(delta, boundary=(idx==gdh_bos_token_id), beta=gdh_scan_beta)`
-- Segmented scan implementation is vectorized (parallel tensor ops), preserving sequence-parallel training behavior while preventing cross-doc accumulation bleed.
-- Boundary-reset behavior is now enforced in mainline via the boundary mask.
-- Write path now applies a final hard bound before accumulation (`delta = tanh(delta)`) to cap update amplitude.
-- Optimizer now uses a lower LR bucket for tied/global GDH tensors (`W_k_read_global`, `W_v_read_global`, `E_slots`, `W_q_slots_global`, and write-brain globals when enabled).
-- Optional EMA scan mode (`gdh_use_ema_scan`) uses data-dependent per-token retention from write gate:
-  - `S_t = g_t * S_{t-1} + (1-g_t) * delta_t`, vectorized + boundary-aware.
+- Mainline temporal integration in `nanochat/gpt.py` is canonical EMA scan:
+  - `S_t = g_t * S_{t-1} + (1-g_t) * delta_t` (slot-wise retention gate)
+- EMA scan implementation is associative + vectorized (parallel tensor ops), boundary-aware, and uses implicit token-0 segment start when no boundary appears yet.
+- Write path applies a single final bound point before accumulation:
+  - `delta = tanh(RMSNorm(delta))`
+  - no additional tanh in earlier `v_upd` path.
+- Write gate is slot-wise (`Linear(D->R)`) in canonical path.
+- Gate output is retention (`g`), so `delta` is not pre-multiplied by `g`.
+- Read-competition gate path is removed from active forward; read injection uses read-mute gate (`W_g_read_mute`, `b_g_read_mute`).
+- Optimizer uses a lower LR bucket for tied/global GDH tensors (`W_k_read_global`, `W_v_read_global`, `E_slots`, `W_q_slots_global`, and write-brain globals when enabled).
 - Layer-sharing policy in `nanochat/gpt.py`:
   - shared across layers: `W_k_read_global`, `W_v_read_global`, `E_slots`, `W_q_slots_global`
   - layer-local: `W_k_write`, `W_v_write`, `W_o_write`, read-local params
 - Canonical naming cleanup:
   - use `W_q_slots_global` (not `W_q_write_global`) for the global slot-query projection.
   - `GDHWriteCore` keeps a legacy alias/loading shim so older checkpoints still restore.
-- Telemetry in `scripts/local_base_train.py` now logs global write-routing diagnostics for `E_slots` and `W_q_slots_global` (including tie checks across layers).
+- Telemetry in `scripts/local_base_train.py` logs global write-routing diagnostics for `E_slots` and `W_q_slots_global` (including tie checks across layers).
+- Telemetry uses retention-gate naming (`retention_gate_*`) in canonical EMA path to avoid polarity confusion.
+- Read-mute telemetry is available per-layer and aggregate (`read_mute_*`).
 
 ## MQAR probe-only extensions (current testbed)
 
@@ -113,6 +117,7 @@ These are active in `experiments/mqar_scan_beta_probe.py` for Stage-1 blindfold 
 - `--recurrent-max-chunks-per-doc` caps how many chunks are taken from one document.
 - Optional GDH chunk-to-chunk state carry is available via `--gdh-recurrent-carry-state`.
 - Carry state is detached each step (TBPTT style) and BOS-aware.
+- Canonical EMA path keeps carry unscaled at handoff (detached, BOS-aware).
 
 ## Future ideas backlog (not implemented yet)
 
