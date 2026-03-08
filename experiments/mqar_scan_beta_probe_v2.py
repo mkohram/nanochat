@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import os
+from pathlib import Path
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Any
@@ -85,6 +86,105 @@ def _pairwise_slot_cos_last_mean(sidecar: torch.Tensor, eps: float = 1e-9) -> fl
     mask = ~torch.eye(r, dtype=torch.bool, device=gram.device)
     vals = gram[:, mask]
     return float(vals.mean().item())
+
+
+def _slot_geometry_stats_last_state(s_last: torch.Tensor, eps: float = 1e-9) -> dict[str, float]:
+    """Geometry/collapse stats from final-token slot states.
+
+    Args:
+      s_last: [B,R,D]
+    """
+    # Use float64 so metrics are stable and immune to autocast bf16 contexts.
+    s = s_last.to(dtype=torch.float64)
+    norms = s.norm(dim=-1).clamp_min(eps)             # [B,R]
+    s_norm = s / norms.unsqueeze(-1)                  # [B,R,D]
+
+    gram_cos = torch.einsum("brd,bsd->brs", s_norm, s_norm)  # [B,R,R]
+    r = gram_cos.shape[-1]
+    mask = ~torch.eye(r, dtype=torch.bool, device=gram_cos.device)
+    vals = gram_cos[:, mask]
+
+    # Participation ratio on slot Gram G = S S^T.
+    gram = torch.einsum("brd,bsd->brs", s, s)        # [B,R,R]
+    tr = torch.diagonal(gram, dim1=-2, dim2=-1).sum(dim=-1)   # [B]
+    tr_g2 = (gram * gram).sum(dim=(-2, -1))                    # [B], since trace(G^2)=sum_ij G_ij^2 for symmetric G
+    pr = (tr * tr) / (tr_g2 + eps)                              # [B]
+
+    norm_mean = float(norms.mean().item())
+    norm_std = float(norms.std().item())
+
+    return {
+        "cos_mean": float(vals.mean().item()),
+        "cos_max": float(vals.max().item()),
+        "cos_p90": float(torch.quantile(vals, 0.90).item()),
+        "participation_ratio": float(pr.mean().item()),
+        "slot_norm_mean": norm_mean,
+        "slot_norm_std": norm_std,
+        "slot_norm_cv": float(norm_std / (norm_mean + eps)),
+        "slot_norm_min": float(norms.min().item()),
+        "slot_norm_max": float(norms.max().item()),
+    }
+
+
+def _histogram_payload(
+    x: torch.Tensor,
+    bins: int = 60,
+    range_override: tuple[float, float] | None = None,
+) -> dict[str, list[float]]:
+    """Compact histogram payload compatible with probe_live_dashboard.
+
+    Range is adaptive to current data unless `range_override` is supplied.
+    """
+    xf = x.detach().float().reshape(-1)
+    finite = torch.isfinite(xf)
+    xf = xf[finite]
+
+    if range_override is not None:
+        lo, hi = float(range_override[0]), float(range_override[1])
+        if hi - lo < 1e-12:
+            pad = max(1e-3, abs(hi) * 0.05 + 1e-6)
+            lo -= pad
+            hi += pad
+    elif xf.numel() == 0:
+        lo, hi = -1.0, 1.0
+    else:
+        lo = float(xf.min().item())
+        hi = float(xf.max().item())
+        if hi - lo < 1e-12:
+            # Degenerate case: all values almost identical.
+            pad = max(1e-3, abs(hi) * 0.05 + 1e-6)
+        else:
+            # Small padding so bars don't stick to chart borders.
+            pad = 0.05 * (hi - lo)
+        lo -= pad
+        hi += pad
+
+    if xf.numel() == 0:
+        vals = torch.zeros(bins, device=x.device)
+    else:
+        vals = torch.histc(xf, bins=bins, min=lo, max=hi)
+    edges = torch.linspace(lo, hi, bins + 1, device=xf.device if xf.numel() > 0 else x.device)
+
+    return {
+        "bins": [float(v) for v in edges.cpu().tolist()],
+        "values": [float(v) for v in vals.cpu().tolist()],
+    }
+
+
+def _write_live_json(path: str | None, args: argparse.Namespace, beta: float, history: list[dict[str, Any]]) -> None:
+    if not path:
+        return
+    payload = {
+        "beta": beta,
+        "config": vars(args),
+        "history": history,
+        "last": history[-1] if history else {},
+    }
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(p)
 
 
 def _compute_answer_metrics(logits: torch.Tensor, targets: torch.Tensor, eval_topk: int) -> dict[str, float]:
@@ -197,8 +297,8 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
         arch=args.arch,
         gdh_slots=args.gdh_slots,
         gdh_write_heads=args.gdh_write_heads,
-        gdh_use_write_brain=True,
-        gdh_write_brain_hidden_mult=4,
+        gdh_use_write_brain=args.gdh_use_write_brain,
+        gdh_write_brain_hidden_mult=args.gdh_write_brain_hidden_mult,
     )
 
     if args.swa_window > 0:
@@ -340,6 +440,21 @@ def _forward_gdh(
     cos_sin = model.cos[:, :n_tokens], model.sin[:, :n_tokens]
 
     layer_slot_cos = []
+    layer_slot_cos_max = []
+    layer_slot_cos_p90 = []
+    layer_participation_ratio = []
+    layer_slot_norm_mean = []
+    layer_slot_norm_std = []
+    layer_slot_norm_cv = []
+    layer_slot_norm_min = []
+    layer_slot_norm_max = []
+
+    layer_usage_entropy_norm = []
+    layer_usage_effective_slots = []
+    layer_usage_max_share = []
+    layer_head_entropy_norm = []
+
+    out_state_last_per_layer = []
     usage_losses = []
 
     for i, block in enumerate(model.transformer.h):
@@ -370,10 +485,35 @@ def _forward_gdh(
         usage_target = torch.full_like(usage, 1.0 / usage.shape[0])
         usage_losses.append((usage - usage_target).pow(2).mean())
 
+        if collect_sidecar:
+            usage_entropy = -(usage * torch.log(usage.clamp_min(1e-12))).sum()
+            usage_entropy_norm = usage_entropy / math.log(float(usage.shape[0])) if usage.shape[0] > 1 else usage_entropy.new_zeros(())
+            layer_usage_entropy_norm.append(float(usage_entropy_norm.item()))
+            layer_usage_effective_slots.append(float(torch.exp(usage_entropy).item()))
+            layer_usage_max_share.append(float(usage.max().item()))
+
+            # Per-head usage entropy.
+            weighted_sum_head = (alpha_soft * gate_weight).sum(dim=(0, 1))  # [h,R]
+            usage_head = weighted_sum_head / weighted_sum_head.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            head_entropy = -(usage_head * torch.log(usage_head.clamp_min(1e-12))).sum(dim=-1)
+            head_entropy_norm = head_entropy / math.log(float(usage_head.shape[-1])) if usage_head.shape[-1] > 1 else torch.zeros_like(head_entropy)
+            layer_head_entropy_norm.append(float(head_entropy_norm.mean().item()))
+
         sidecar = sidecar + _scan_accumulate(delta, scan_beta=scan_beta)
 
         if collect_sidecar:
-            layer_slot_cos.append(_pairwise_slot_cos_last_mean(sidecar))
+            s_last = sidecar[:, -1].detach()
+            geo = _slot_geometry_stats_last_state(s_last)
+            layer_slot_cos.append(geo["cos_mean"])
+            layer_slot_cos_max.append(geo["cos_max"])
+            layer_slot_cos_p90.append(geo["cos_p90"])
+            layer_participation_ratio.append(geo["participation_ratio"])
+            layer_slot_norm_mean.append(geo["slot_norm_mean"])
+            layer_slot_norm_std.append(geo["slot_norm_std"])
+            layer_slot_norm_cv.append(geo["slot_norm_cv"])
+            layer_slot_norm_min.append(geo["slot_norm_min"])
+            layer_slot_norm_max.append(geo["slot_norm_max"])
+            out_state_last_per_layer.append(s_last)
 
     x = gpt_norm(x)
     logits = model.lm_head(x)[..., :model.config.vocab_size].float()
@@ -385,7 +525,53 @@ def _forward_gdh(
     total_loss = ce_loss + usage_balance_lambda * usage_loss
 
     metrics = _compute_answer_metrics(logits, targets, eval_topk=eval_topk)
-    stats = {"slot_cos_mean_last_per_layer": layer_slot_cos} if collect_sidecar else None
+    if collect_sidecar:
+        # Use a shared adaptive range across layers so overlay x-axis is consistent.
+        flat_all = torch.cat([s.float().reshape(-1) for s in out_state_last_per_layer], dim=0)
+        finite_all = flat_all[torch.isfinite(flat_all)]
+        if finite_all.numel() == 0:
+            hist_range = (-1.0, 1.0)
+        else:
+            lo = float(finite_all.min().item())
+            hi = float(finite_all.max().item())
+            if hi - lo < 1e-12:
+                pad = max(1e-3, abs(hi) * 0.05 + 1e-6)
+            else:
+                pad = 0.05 * (hi - lo)
+            hist_range = (lo - pad, hi + pad)
+
+        out_state_hist_layers = [
+            _histogram_payload(s, range_override=hist_range) for s in out_state_last_per_layer
+        ]
+
+        out_last = sidecar[:, -1].detach().float().reshape(-1)
+        out_stats = {
+            "min": float(out_last.min().item()),
+            "max": float(out_last.max().item()),
+            "p01": float(torch.quantile(out_last, 0.01).item()),
+            "p50": float(torch.quantile(out_last, 0.50).item()),
+            "p99": float(torch.quantile(out_last, 0.99).item()),
+            "std": float(out_last.std().item()),
+        }
+        stats = {
+            "slot_cos_mean_last_per_layer": layer_slot_cos,
+            "slot_cos_max_last_per_layer": layer_slot_cos_max,
+            "slot_cos_p90_last_per_layer": layer_slot_cos_p90,
+            "slot_participation_ratio_last_per_layer": layer_participation_ratio,
+            "slot_norm_mean_last_per_layer": layer_slot_norm_mean,
+            "slot_norm_std_last_per_layer": layer_slot_norm_std,
+            "slot_norm_cv_last_per_layer": layer_slot_norm_cv,
+            "slot_norm_min_last_per_layer": layer_slot_norm_min,
+            "slot_norm_max_last_per_layer": layer_slot_norm_max,
+            "slot_usage_entropy_norm_per_layer": layer_usage_entropy_norm,
+            "slot_usage_effective_slots_per_layer": layer_usage_effective_slots,
+            "slot_usage_max_share_per_layer": layer_usage_max_share,
+            "slot_usage_head_entropy_norm_per_layer": layer_head_entropy_norm,
+            "out_state_hist_layers": out_state_hist_layers,
+            "out_state_stats": out_stats,
+        }
+    else:
+        stats = None
     return total_loss, ce_loss, usage_loss, metrics, stats
 
 
@@ -476,9 +662,36 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         if args.arch == "gdh":
             rec["slot_cos_l_last"] = float(stats["slot_cos_mean_last_per_layer"][-1])
             rec["slot_cos_layers"] = [float(v) for v in stats["slot_cos_mean_last_per_layer"]]
+            rec["slot_cos_max_layers"] = [float(v) for v in stats.get("slot_cos_max_last_per_layer", [])]
+            rec["slot_cos_p90_layers"] = [float(v) for v in stats.get("slot_cos_p90_last_per_layer", [])]
+
+            rec["slot_participation_ratio_layers"] = [float(v) for v in stats.get("slot_participation_ratio_last_per_layer", [])]
+            rec["slot_norm_mean_layers"] = [float(v) for v in stats.get("slot_norm_mean_last_per_layer", [])]
+            rec["slot_norm_std_layers"] = [float(v) for v in stats.get("slot_norm_std_last_per_layer", [])]
+            rec["slot_norm_cv_layers"] = [float(v) for v in stats.get("slot_norm_cv_last_per_layer", [])]
+
+            rec["slot_usage_entropy_norm_layers"] = [float(v) for v in stats.get("slot_usage_entropy_norm_per_layer", [])]
+            rec["slot_usage_effective_slots_layers"] = [float(v) for v in stats.get("slot_usage_effective_slots_per_layer", [])]
+            rec["slot_usage_max_share_layers"] = [float(v) for v in stats.get("slot_usage_max_share_per_layer", [])]
+            rec["slot_usage_head_entropy_norm_layers"] = [float(v) for v in stats.get("slot_usage_head_entropy_norm_per_layer", [])]
+
+            rec["out_state_hist_layers"] = stats.get("out_state_hist_layers", [])
+            rec["out_state_stats"] = stats.get("out_state_stats", {})
         else:
             rec["slot_cos_l_last"] = None
             rec["slot_cos_layers"] = []
+            rec["slot_cos_max_layers"] = []
+            rec["slot_cos_p90_layers"] = []
+            rec["slot_participation_ratio_layers"] = []
+            rec["slot_norm_mean_layers"] = []
+            rec["slot_norm_std_layers"] = []
+            rec["slot_norm_cv_layers"] = []
+            rec["slot_usage_entropy_norm_layers"] = []
+            rec["slot_usage_effective_slots_layers"] = []
+            rec["slot_usage_max_share_layers"] = []
+            rec["slot_usage_head_entropy_norm_layers"] = []
+            rec["out_state_hist_layers"] = []
+            rec["out_state_stats"] = {}
 
         if train_total is not None:
             rec["train_total"] = float(train_total)
@@ -492,6 +705,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             rec["train_mrr"] = float(train_mrr)
 
         history.append(rec)
+        _write_live_json(args.live_json, args, beta, history)
 
         # Progress line (helps keep long runs alive and visible).
         cos_txt = "n/a" if rec["slot_cos_l_last"] is None else f"{rec['slot_cos_l_last']:.4f}"
@@ -648,6 +862,11 @@ def main() -> None:
     p.add_argument("--gdh-slots", type=int, default=8)
     p.add_argument("--gdh-write-heads", type=int, default=8)
     p.add_argument("--gdh-use-read-gate", action="store_true", help="enable GDH read gate")
+    p.add_argument("--gdh-use-write-brain", dest="gdh_use_write_brain", action="store_true", default=True,
+                   help="enable GDH write-brain residual MLP (default: on)")
+    p.add_argument("--gdh-no-write-brain", dest="gdh_use_write_brain", action="store_false",
+                   help="disable GDH write-brain residual MLP")
+    p.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4)
     p.add_argument("--route-topk", type=int, default=0)
     p.add_argument("--usage-balance-lambda", type=float, default=0.0)
 
@@ -679,6 +898,7 @@ def main() -> None:
     p.add_argument("--enforce-capacity-stress", action="store_true", help="require n_pairs > gdh_slots")
 
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--live-json", type=str, default="experiments/out/probe_live.json", help="path for live dashboard JSON updates")
     args = p.parse_args()
 
     # Safety checks.
