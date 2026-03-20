@@ -87,6 +87,36 @@ def _pairwise_slot_cos_last_mean(sidecar: torch.Tensor, eps: float = 1e-9) -> fl
     return float(vals.mean().item())
 
 
+def _out_state_hist_last(sidecar: torch.Tensor, bins: int = 80) -> dict[str, Any]:
+    """Adaptive histogram + stats for final-token sidecar values (no clipping)."""
+    x = sidecar.float()[:, -1].reshape(-1)
+    if x.numel() == 0:
+        return {"bins": [], "values": [], "stats": {}}
+
+    x_min = float(x.min().item())
+    x_max = float(x.max().item())
+    if x_max <= x_min:
+        eps = 1e-6
+        x_min -= eps
+        x_max += eps
+
+    vals = torch.histc(x, bins=bins, min=x_min, max=x_max).cpu().tolist()
+    edges = torch.linspace(x_min, x_max, bins + 1, device=x.device).cpu().tolist()
+
+    q = torch.quantile(x, torch.tensor([0.01, 0.50, 0.99], device=x.device, dtype=x.dtype))
+    stats = {
+        "min": x_min,
+        "max": x_max,
+        "mean": float(x.mean().item()),
+        "std": float(x.std(unbiased=False).item()),
+        "p01": float(q[0].item()),
+        "p50": float(q[1].item()),
+        "p99": float(q[2].item()),
+        "abs_max": float(x.abs().max().item()),
+    }
+    return {"bins": edges, "values": vals, "stats": stats}
+
+
 def _compute_answer_metrics(logits: torch.Tensor, targets: torch.Tensor, eval_topk: int) -> dict[str, float]:
     """Compute answer-only metrics using masked targets (-100 excluded)."""
     with torch.no_grad():
@@ -134,6 +164,7 @@ def _write_delta_and_alpha(
     n_write_heads: int,
     route_topk: int,
     eps: float,
+    gate_proj: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Mirror mainline GDH write delta with optional top-k routing.
 
@@ -175,46 +206,11 @@ def _write_delta_and_alpha(
     delta = write_core._apply_write_brain(delta, eps=eps)
 
     g_write = None
+    if gate_proj is not None:
+        g_write = torch.sigmoid(gate_proj(x_write)).unsqueeze(-2)  # [B,N,1,1]
+        delta = delta * g_write
+
     return delta, alpha, alpha_soft, g_write
-
-
-def _apply_legacy_20260223_gdh_freeze(model: GPT) -> None:
-    """Force GDH probe internals toward 2026-02-23 probe-era behavior.
-
-    This intentionally decouples probe behavior from evolving mainline defaults.
-    """
-    if getattr(model, "arch", "").lower() != "gdh":
-        return
-
-    std = model.config.n_embd ** -0.5
-    with torch.no_grad():
-        for i in range(len(model.gdh_read)):
-            r = model.gdh_read[i]
-            w = model.gdh_write[i]
-
-            # Legacy read path: no read-mute gate in probe-era runs.
-            if hasattr(r, "use_read_mute_gate"):
-                r.use_read_mute_gate = False
-
-            # Legacy-ish matrix init family used in probe-era GDH modules.
-            torch.nn.init.normal_(r.W_q_read, mean=0.0, std=std)
-            torch.nn.init.normal_(r.W_k_read_global, mean=0.0, std=std)
-            torch.nn.init.normal_(r.W_v_read_global, mean=0.0, std=std)
-            torch.nn.init.normal_(r.W_o_read, mean=0.0, std=std)
-
-            torch.nn.init.normal_(w.E_slots, mean=0.0, std=1.0)
-            torch.nn.init.normal_(w.W_q_slots_global, mean=0.0, std=std)
-            torch.nn.init.normal_(w.W_k_write, mean=0.0, std=std)
-            torch.nn.init.normal_(w.W_v_write, mean=0.0, std=std)
-            torch.nn.init.normal_(w.W_o_write, mean=0.0, std=std)
-
-            if getattr(w, "W_write_mlp_in_global", None) is not None:
-                torch.nn.init.normal_(w.W_write_mlp_in_global, mean=0.0, std=std)
-                torch.nn.init.zeros_(w.W_write_mlp_out_global)
-
-        # Probe-era warmstart for first read mixers.
-        for i in range(min(2, len(model.gdh_read))):
-            torch.nn.init.normal_(model.gdh_read[i].W_o_read, mean=0.0, std=0.02)
 
 
 def _build_model(args: argparse.Namespace, device: str) -> GPT:
@@ -242,8 +238,11 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
 
     model.init_weights()
 
+    # Mild warm-start for read output projections when GDH is enabled.
     if args.arch == "gdh":
-        _apply_legacy_20260223_gdh_freeze(model)
+        with torch.no_grad():
+            for i in range(min(2, len(model.gdh_read))):
+                torch.nn.init.normal_(model.gdh_read[i].W_o_read, mean=0.0, std=0.02)
 
     return model
 
@@ -363,6 +362,7 @@ def _forward_gdh(
     cos_sin = model.cos[:, :n_tokens], model.sin[:, :n_tokens]
 
     layer_slot_cos = []
+    layer_out_state_hist = []
     usage_losses = []
 
     for i, block in enumerate(model.transformer.h):
@@ -378,6 +378,7 @@ def _forward_gdh(
             n_write_heads=gdh_heads,
             route_topk=route_topk,
             eps=1e-6,
+            gate_proj=None,
         )
 
         # Routing usage balancing (layer-local): encourage uniform slot usage.
@@ -394,6 +395,7 @@ def _forward_gdh(
 
         if collect_sidecar:
             layer_slot_cos.append(_pairwise_slot_cos_last_mean(sidecar))
+            layer_out_state_hist.append(_out_state_hist_last(sidecar))
 
     x = gpt_norm(x)
     logits = model.lm_head(x)[..., :model.config.vocab_size].float()
@@ -405,7 +407,13 @@ def _forward_gdh(
     total_loss = ce_loss + usage_balance_lambda * usage_loss
 
     metrics = _compute_answer_metrics(logits, targets, eval_topk=eval_topk)
-    stats = {"slot_cos_mean_last_per_layer": layer_slot_cos} if collect_sidecar else None
+    if collect_sidecar:
+        stats = {
+            "slot_cos_mean_last_per_layer": layer_slot_cos,
+            "out_state_hist_last_per_layer": layer_out_state_hist,
+        }
+    else:
+        stats = None
     return total_loss, ce_loss, usage_loss, metrics, stats
 
 
@@ -496,9 +504,17 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         if args.arch == "gdh":
             rec["slot_cos_l_last"] = float(stats["slot_cos_mean_last_per_layer"][-1])
             rec["slot_cos_layers"] = [float(v) for v in stats["slot_cos_mean_last_per_layer"]]
+            rec["out_state_hist_layers"] = stats.get("out_state_hist_last_per_layer", [])
+            rec["out_state_hist"] = rec["out_state_hist_layers"][-1] if rec["out_state_hist_layers"] else None
+            rec["out_state_stats_layers"] = [h.get("stats", {}) for h in rec["out_state_hist_layers"] if isinstance(h, dict)]
+            rec["out_state_stats"] = rec["out_state_stats_layers"][-1] if rec["out_state_stats_layers"] else None
         else:
             rec["slot_cos_l_last"] = None
             rec["slot_cos_layers"] = []
+            rec["out_state_hist_layers"] = []
+            rec["out_state_hist"] = None
+            rec["out_state_stats_layers"] = []
+            rec["out_state_stats"] = None
 
         if train_total is not None:
             rec["train_total"] = float(train_total)
@@ -512,6 +528,22 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             rec["train_mrr"] = float(train_mrr)
 
         history.append(rec)
+
+        # Optional live snapshot for dashboard.
+        if getattr(args, "live_json", ""):
+            try:
+                live_payload = {
+                    "config": vars(args),
+                    "beta": beta,
+                    "history": history,
+                    "last": rec,
+                }
+                tmp_path = args.live_json + ".tmp"
+                with open(tmp_path, "w") as f:
+                    json.dump(live_payload, f)
+                os.replace(tmp_path, args.live_json)
+            except Exception:
+                pass
 
         # Progress line (helps keep long runs alive and visible).
         cos_txt = "n/a" if rec["slot_cos_l_last"] is None else f"{rec['slot_cos_l_last']:.4f}"
@@ -699,6 +731,7 @@ def main() -> None:
     p.add_argument("--enforce-capacity-stress", action="store_true", help="require n_pairs > gdh_slots")
 
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--live-json", type=str, default="", help="optional path to continuously write live metrics JSON")
     args = p.parse_args()
 
     # Safety checks.

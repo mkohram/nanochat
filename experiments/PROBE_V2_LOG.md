@@ -96,6 +96,27 @@ Status: TODO
 - Next:
   - hard-freeze full probe stack by pinning exact historical model components (not just script-level patching).
 
+### 2026-03-07 — Entry 03 (easy ablation: usage-balance lambda -> 0.0)
+- Date/time: 2026-03-07 20:11–20:16
+- Hypothesis: removing routing usage balance may simplify dynamics but could reduce slot utilization quality and downstream retrieval.
+- Change:
+  - No code change; runtime ablation only.
+  - Ran canonical easy config with `--usage-balance-lambda 0.0` (write-brain already disabled).
+- Command:
+  - `experiments/run_probe_easy.sh --usage-balance-lambda 0.0`
+- Key outputs:
+  - Ablation artifacts:
+    - JSON: `experiments/out/mqar_scan_beta_probe_20260307_201626.json`
+    - PNG: `experiments/out/mqar_scan_beta_probe_20260307_201626.png`
+    - Final: `eval_acc_top1=0.625`, `eval_mrr=0.8125`, `slot_cos_last=0.3739`
+  - Recent non-ablated easy references (`usage_balance_lambda=0.01`, write-brain off):
+    - `experiments/out/mqar_scan_beta_probe_20260307_194032.json` -> `acc1=0.75`, `mrr=0.8646`
+    - `experiments/out/mqar_scan_beta_probe_20260307_200019.json` -> `acc1=0.75`, `mrr=0.8646`
+- Verdict:
+  - Keep `usage_balance_lambda=0.01` as default for now (better task metrics in this easy regime).
+- Next:
+  - Run canonical hard config with no ablation (baseline hard behavior with current probe stack).
+
 ### Entry template
 - Date/time:
 - Hypothesis:
