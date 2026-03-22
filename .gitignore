@@ -17,3 +17,5 @@ leaderboard/
 leadercards/
 experiments/out/
 reports/
+node_modules/
+experiments/probe-dashboard/dist/

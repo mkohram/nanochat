@@ -19,7 +19,7 @@ echo "$LOG" > "${OUT_DIR}/probe_current_log_path.txt"
 echo "[run_probe_hard] log: $LOG"
 echo "[run_probe_hard] live_json: $LIVE_JSON"
 
-exec "$PY" experiments/mqar_scan_beta_probe_v2.py \
+exec "$PY" experiments/mqar_gdh_lab.py \
   --arch gdh \
   --betas 1.0 \
   --steps 5000 \

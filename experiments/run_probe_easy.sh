@@ -19,7 +19,7 @@ echo "$LOG" > "${OUT_DIR}/probe_current_log_path.txt"
 echo "[run_probe_easy] log: $LOG"
 echo "[run_probe_easy] live_json: $LIVE_JSON"
 
-exec "$PY" experiments/mqar_scan_beta_probe_v2.py \
+exec "$PY" experiments/mqar_gdh_lab.py \
   --arch gdh \
   --betas 1.0 \
   --steps 5000 \
@@ -32,7 +32,6 @@ exec "$PY" experiments/mqar_scan_beta_probe_v2.py \
   --n-embd 64 \
   --gdh-slots 8 \
   --gdh-write-heads 8 \
-  --gdh-no-write-brain \
   --route-topk 4 \
   --usage-balance-lambda 0.01 \
   --swa-window 8 \
