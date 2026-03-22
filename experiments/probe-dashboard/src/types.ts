@@ -9,6 +9,8 @@ export type ProbeHistoryPoint = {
   beta?: number
   run_label?: string
   lr?: number
+  wall_time_s?: number
+  wall_time_min?: number
   eval_total?: number
   eval_ce?: number
   eval_usage_loss?: number

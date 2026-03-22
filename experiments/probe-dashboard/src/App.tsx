@@ -4,6 +4,7 @@ import {
   Legend,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -56,6 +57,21 @@ function paddedDomain(values: Array<number | null | undefined>, padFrac = 0.08):
   }
   const pad = (hi - lo) * padFrac
   return [lo - pad, hi + pad]
+}
+
+function carryForward(values: Array<number | null | undefined>): Array<number | null> {
+  let last: number | null = null
+  return values.map((v) => {
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      last = v
+      return v
+    }
+    return last
+  })
+}
+
+function vocabRandomCE(vocabSize: unknown): number | null {
+  return typeof vocabSize === 'number' && Number.isFinite(vocabSize) && vocabSize > 0 ? Math.log(vocabSize) : null
 }
 
 function layerSeries(history: ProbeHistoryPoint[], key: string) {
@@ -236,7 +252,7 @@ function ExportButton({ filename = 'chart.png' }: { filename?: string }) {
 }
 
 export function App() {
-  const defaultUrl = window.__PROBE_DASHBOARD_DEFAULT_URL__ ?? '../out/probe_live.json'
+  const defaultUrl = window.__PROBE_DASHBOARD_DEFAULT_URL__ ?? '/probe-data/live.json'
   const [source, setSource] = useState(defaultUrl)
   const [payload, setPayload] = useState<ProbePayload | null>(null)
   const [status, setStatus] = useState('idle')
@@ -271,14 +287,22 @@ export function App() {
   const last = flattened.last
   const runLabel = flattened.runLabel ?? '—'
 
-  const learningData = history.map((row) => ({
+  const rawEvalMrr = history.map((row) => (typeof row.eval_mrr === 'number' ? row.eval_mrr : null))
+  const shownEvalMrr = carryForward(rawEvalMrr)
+  const learningData = history.map((row, i) => ({
     step: row.step,
+    wall_time_min: typeof row.wall_time_min === 'number' ? row.wall_time_min : null,
     eval_acc_top1: typeof row.eval_acc_top1 === 'number' ? row.eval_acc_top1 : null,
-    eval_mrr: typeof row.eval_mrr === 'number' ? row.eval_mrr : null,
+    eval_mrr: shownEvalMrr[i],
     eval_ce: typeof row.eval_ce === 'number' ? row.eval_ce : null,
     train_ce: typeof row.train_ce === 'number' ? row.train_ce : null,
+    full_metrics: Boolean(row.full_metrics),
   }))
-  const ceDomain = paddedDomain(learningData.flatMap((row) => [row.eval_ce, row.train_ce]), 0.06)
+  const randomCe = vocabRandomCE(payload?.config?.vocab_size)
+  const ceDomain = paddedDomain([
+    ...learningData.flatMap((row) => [row.eval_ce, row.train_ce]),
+    randomCe,
+  ], 0.06)
   const histData = histOverlayData(last?.out_state_hist_layers)
   const histLayerCount = last?.out_state_hist_layers?.length ?? 0
   const availableHeatmapLayers = Math.max(last?.sidecar_norm_trace_layers?.length ?? 0, last?.sidecar_last_layers?.length ?? 0)
@@ -316,6 +340,7 @@ export function App() {
       <div className="stats-grid">
         <StatCard title="Run label" value={runLabel} subtitle={history.length ? `${history.length} points` : 'no history yet'} />
         <StatCard title="Step" value={last ? String(last.step) : '—'} subtitle={payload?.beta !== undefined ? `beta=${payload.beta}` : undefined} />
+        <StatCard title="Wall time" value={fmt(last?.wall_time_min, 2)} subtitle="minutes" />
         <StatCard title="Eval top1" value={fmt(last?.eval_acc_top1)} subtitle={`MRR ${fmt(last?.eval_mrr)}`} />
         <StatCard title="Eval CE" value={fmt(last?.eval_ce)} subtitle={`Train CE ${fmt(last?.train_ce)}`} />
         <StatCard title="Slot cosine" value={fmt(last?.slot_cos_l_last)} subtitle="last layer" />
@@ -336,10 +361,25 @@ export function App() {
                 <XAxis dataKey="step" />
                 <YAxis yAxisId="left" domain={[0, 1]} />
                 <YAxis yAxisId="right" orientation="right" domain={[0, 1]} />
-                <Tooltip />
+                <Tooltip formatter={(value: unknown) => fmt(value, 4)} />
                 <Legend />
-                <Line yAxisId="left" type="monotone" dataKey="eval_acc_top1" stroke="#2563eb" dot={false} />
-                <Line yAxisId="right" type="monotone" dataKey="eval_mrr" stroke="#7c3aed" dot={false} />
+                <Line yAxisId="left" type="monotone" dataKey="eval_acc_top1" stroke="#2563eb" dot={false} connectNulls />
+                <Line yAxisId="right" type="monotone" dataKey="eval_mrr" name="eval_mrr" stroke="#7c3aed" dot={false} connectNulls />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
+
+        <Panel title="Wall time vs step">
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <LineChart data={learningData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="step" />
+                <YAxis tickFormatter={(v) => fmt(v, 1)} width={54} />
+                <Tooltip formatter={(value: unknown) => `${fmt(value, 2)} min`} />
+                <Legend />
+                <Line type="monotone" dataKey="wall_time_min" name="wall_time_min" stroke="#16a34a" dot={false} strokeWidth={2} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -351,11 +391,20 @@ export function App() {
               <LineChart data={learningData}>
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="step" />
-                <YAxis domain={ceDomain ?? ['auto', 'auto']} />
-                <Tooltip />
+                <YAxis domain={ceDomain ?? ['auto', 'auto']} tickFormatter={(v) => fmt(v, 2)} width={54} />
+                <Tooltip formatter={(value: unknown) => fmt(value, 3)} />
                 <Legend />
-                <Line type="monotone" dataKey="eval_ce" stroke="#dc2626" dot={false} strokeWidth={2} />
-                <Line type="monotone" dataKey="train_ce" stroke="#0ea5e9" dot={false} strokeWidth={2} />
+                {randomCe !== null ? (
+                  <ReferenceLine
+                    y={randomCe}
+                    stroke="#64748b"
+                    strokeDasharray="6 4"
+                    ifOverflow="extendDomain"
+                    label={{ value: `random ${fmt(randomCe, 3)}`, position: 'insideTopRight', fill: '#475569', fontSize: 12 }}
+                  />
+                ) : null}
+                <Line type="monotone" dataKey="eval_ce" name="eval_ce" stroke="#dc2626" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="train_ce" name="train_ce" stroke="#0ea5e9" dot={false} strokeWidth={2} />
               </LineChart>
             </ResponsiveContainer>
           </div>
