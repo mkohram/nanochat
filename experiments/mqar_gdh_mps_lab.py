@@ -92,6 +92,10 @@ def _scan_accumulate(delta: torch.Tensor, scan_beta: float) -> torch.Tensor:
 
     Vectorized closed form:
       y_t = beta^t * cumsum(delta_t * beta^{-t})
+
+    Use fp32 for the internal leaky-scan math so this stays on-device on MPS
+    (float64 is unsupported there) while retaining better numerical stability
+    than bf16/fp16 autocast inputs.
     """
     if scan_beta >= 1.0:
         return torch.cumsum(delta, dim=1)
@@ -99,12 +103,13 @@ def _scan_accumulate(delta: torch.Tensor, scan_beta: float) -> torch.Tensor:
         return delta
 
     t = delta.shape[1]
-    beta = torch.tensor(float(scan_beta), device=delta.device, dtype=torch.float64)
-    idx = torch.arange(t, device=delta.device, dtype=torch.float64)
+    work_dtype = torch.float32
+    beta = torch.tensor(float(scan_beta), device=delta.device, dtype=work_dtype)
+    idx = torch.arange(t, device=delta.device, dtype=work_dtype)
     beta_pow = torch.pow(beta, idx)
     beta_inv = torch.pow(beta, -idx)
 
-    x = delta.to(torch.float64)
+    x = delta.to(work_dtype)
     y = torch.cumsum(x * beta_inv.view(1, t, 1, 1), dim=1) * beta_pow.view(1, t, 1, 1)
     return y.to(delta.dtype)
 
@@ -247,6 +252,55 @@ def _compute_answer_metrics(
         }
 
 
+def _read_from_sidecar(
+    read_core,
+    local: torch.Tensor,
+    sidecar_prev: torch.Tensor,
+    *,
+    eps: float,
+    read_mute_floor: float = 0.0,
+) -> torch.Tensor:
+    """Reduced GDH read path used by this lab harness.
+
+    This is intentionally implemented locally in the probe so GDH-side math lives in
+    `experiments/mqar_gdh_mps_lab.py` rather than delegating to `nanochat.double_helix`.
+
+    Current probe ablation default:
+    - read_mute_floor=0.0 => pure sigmoid read-mute gate
+    """
+    bsz, n_tokens, d = local.shape
+    assert sidecar_prev.shape[:2] == (bsz, n_tokens)
+
+    x_read = _rms_norm(local, eps=eps)                                  # [B,N,D]
+    q_loc = torch.matmul(x_read, read_core.W_q_read)                    # [B,N,D]
+
+    s_hat = _rms_norm(sidecar_prev, eps=eps)                            # [B,N,R,D]
+    k_mem = torch.einsum("bnrd,df->bnrf", s_hat, read_core.W_k_read_global)
+    v_mem = torch.einsum("bnrd,df->bnrf", s_hat, read_core.W_v_read_global)
+
+    logits = torch.einsum("bnd,bnrd->bnr", q_loc, k_mem) / math.sqrt(d)
+    alpha = torch.softmax(logits, dim=-1)                               # [B,N,R]
+    z_read = torch.einsum("bnr,bnrd->bnd", alpha, v_mem)               # [B,N,D]
+
+    z_proj = torch.matmul(z_read, read_core.W_o_read)                   # [B,N,D]
+    if getattr(read_core, "use_read_mute_gate", True):
+        read_mute = torch.sigmoid(torch.matmul(x_read, read_core.W_g_read_mute) + read_core.b_g_read_mute)
+        if read_mute_floor != 0.0:
+            read_mute = read_mute_floor + (1.0 - read_mute_floor) * read_mute
+        z_proj = read_mute * z_proj
+
+    return local + z_proj
+
+
+def _apply_write_brain_local(write_core, delta: torch.Tensor, *, eps: float) -> torch.Tensor:
+    """Probe-local write-brain residual, kept here so GDH math stays self-contained."""
+    if not getattr(write_core, "use_write_brain", False) or write_core.W_write_mlp_in_global is None:
+        return delta
+    delta_norm = _rms_norm(delta, eps=eps)
+    hidden = torch.relu(torch.matmul(delta_norm, write_core.W_write_mlp_in_global)).square()
+    return delta + torch.matmul(hidden, write_core.W_write_mlp_out_global)
+
+
 def _write_delta_and_alpha(
     write_core,
     local_out: torch.Tensor,
@@ -292,7 +346,7 @@ def _write_delta_and_alpha(
     delta_heads = torch.einsum("bnhr,bnhd->bnhrd", alpha, v_h)
     delta_raw = delta_heads.permute(0, 1, 3, 2, 4).contiguous().view(bsz, n_tokens, r, d)
     delta = torch.einsum("bnrd,df->bnrf", delta_raw, write_core.W_o_write)
-    delta = write_core._apply_write_brain(delta, eps=eps)
+    delta = _apply_write_brain_local(write_core, delta, eps=eps)
 
     return delta, alpha, alpha_soft
 
@@ -483,7 +537,7 @@ def _forward_gdh(
 
     for i, block in enumerate(model.transformer.h):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
-        x = model.gdh_read[i].forward_sequence(x, sidecar, eps=1e-6)
+        x = _read_from_sidecar(model.gdh_read[i], x, sidecar, eps=1e-6, read_mute_floor=0.0)
         ve = model.value_embeds[str(i)](idx) if str(i) in model.value_embeds else None
         x = block(x, ve, cos_sin, model.window_sizes[i], kv_cache=None)
 

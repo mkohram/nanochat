@@ -70,6 +70,10 @@ def _scan_accumulate(delta: torch.Tensor, scan_beta: float) -> torch.Tensor:
 
     Vectorized closed form:
       y_t = beta^t * cumsum(delta_t * beta^{-t})
+
+    Use fp32 for the internal leaky-scan math so this stays on-device on MPS
+    (float64 is unsupported there) while retaining better numerical stability
+    than bf16/fp16 autocast inputs.
     """
     if scan_beta >= 1.0:
         return torch.cumsum(delta, dim=1)
@@ -77,12 +81,13 @@ def _scan_accumulate(delta: torch.Tensor, scan_beta: float) -> torch.Tensor:
         return delta
 
     t = delta.shape[1]
-    beta = torch.tensor(float(scan_beta), device=delta.device, dtype=torch.float64)
-    idx = torch.arange(t, device=delta.device, dtype=torch.float64)
+    work_dtype = torch.float32
+    beta = torch.tensor(float(scan_beta), device=delta.device, dtype=work_dtype)
+    idx = torch.arange(t, device=delta.device, dtype=work_dtype)
     beta_pow = torch.pow(beta, idx)
     beta_inv = torch.pow(beta, -idx)
 
-    x = delta.to(torch.float64)
+    x = delta.to(work_dtype)
     y = torch.cumsum(x * beta_inv.view(1, t, 1, 1), dim=1) * beta_pow.view(1, t, 1, 1)
     return y.to(delta.dtype)
 
