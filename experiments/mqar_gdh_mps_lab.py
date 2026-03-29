@@ -536,16 +536,11 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
             read_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
             write_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
 
-        compute_dtype = model.transformer.wte.weight.dtype
-        if compute_dtype != torch.float32:
-            model.gdh_read.to(dtype=compute_dtype)
-            model.gdh_write.to(dtype=compute_dtype)
+        if model.transformer.wte.weight.device.type == "cuda":
+            model.gdh_read.to(dtype=torch.bfloat16)
+            model.gdh_write.to(dtype=torch.bfloat16)
 
-        # Mild warm-start for early GDH read mixing in the reduced lab setup.
-        # Probe default keeps read-mute disabled unless explicitly re-enabled.
         with torch.no_grad():
-            for i in range(min(2, len(model.gdh_read))):
-                torch.nn.init.normal_(model.gdh_read[i].W_o_read, mean=0.0, std=0.02)
             for read_core in model.gdh_read:
                 read_core.use_read_mute_gate = bool(args.read_mute_gate)
     else:
