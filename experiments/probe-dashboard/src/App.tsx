@@ -31,6 +31,7 @@ function compactConfig(cfg?: Record<string, unknown>): string {
   const keys = [
     'arch','betas','steps','log_every','seed','sequence_len','vocab_size',
     'n_layer','n_head','n_embd','gdh_slots','gdh_write_heads',
+    'gdh_use_write_brain','gdh_write_brain_hidden_mult','read_mute_gate',
     'route_topk','usage_balance_lambda','swa_window','n_pairs','n_queries',
     'gap_min','gap_max','batch_size','eval_batch_size','lr','lr_decay_iters','min_lr','device',
   ]
@@ -72,6 +73,17 @@ function carryForward(values: Array<number | null | undefined>): Array<number | 
 
 function vocabRandomCE(vocabSize: unknown): number | null {
   return typeof vocabSize === 'number' && Number.isFinite(vocabSize) && vocabSize > 0 ? Math.log(vocabSize) : null
+}
+
+function vocabRandomTop1(vocabSize: unknown): number | null {
+  return typeof vocabSize === 'number' && Number.isFinite(vocabSize) && vocabSize > 0 ? 1 / vocabSize : null
+}
+
+function vocabRandomMRR(vocabSize: unknown): number | null {
+  if (typeof vocabSize !== 'number' || !Number.isFinite(vocabSize) || vocabSize <= 0) return null
+  let h = 0
+  for (let i = 1; i <= vocabSize; i += 1) h += 1 / i
+  return h / vocabSize
 }
 
 function layerSeries(history: ProbeHistoryPoint[], key: string) {
@@ -299,6 +311,8 @@ export function App() {
     full_metrics: Boolean(row.full_metrics),
   }))
   const randomCe = vocabRandomCE(payload?.config?.vocab_size)
+  const randomTop1 = vocabRandomTop1(payload?.config?.vocab_size)
+  const randomMrr = vocabRandomMRR(payload?.config?.vocab_size)
   const ceDomain = paddedDomain([
     ...learningData.flatMap((row) => [row.eval_ce, row.train_ce]),
     randomCe,
@@ -363,6 +377,26 @@ export function App() {
                 <YAxis yAxisId="right" orientation="right" domain={[0, 1]} />
                 <Tooltip formatter={(value: unknown) => fmt(value, 4)} />
                 <Legend />
+                {randomTop1 !== null ? (
+                  <ReferenceLine
+                    yAxisId="left"
+                    y={randomTop1}
+                    stroke="#64748b"
+                    strokeDasharray="6 4"
+                    ifOverflow="extendDomain"
+                    label={{ value: `random top1 ${fmt(randomTop1, 4)}`, position: 'insideBottomRight', fill: '#475569', fontSize: 12 }}
+                  />
+                ) : null}
+                {randomMrr !== null ? (
+                  <ReferenceLine
+                    yAxisId="right"
+                    y={randomMrr}
+                    stroke="#a855f7"
+                    strokeDasharray="6 4"
+                    ifOverflow="extendDomain"
+                    label={{ value: `random MRR ${fmt(randomMrr, 4)}`, position: 'insideTopRight', fill: '#6d28d9', fontSize: 12 }}
+                  />
+                ) : null}
                 <Line yAxisId="left" type="monotone" dataKey="eval_acc_top1" stroke="#2563eb" dot={false} connectNulls />
                 <Line yAxisId="right" type="monotone" dataKey="eval_mrr" name="eval_mrr" stroke="#7c3aed" dot={false} connectNulls />
               </LineChart>

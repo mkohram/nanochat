@@ -258,7 +258,6 @@ def _read_from_sidecar(
     sidecar_prev: torch.Tensor,
     *,
     eps: float,
-    read_mute_floor: float = 0.0,
 ) -> torch.Tensor:
     """Reduced GDH read path used by this lab harness.
 
@@ -266,7 +265,8 @@ def _read_from_sidecar(
     `experiments/mqar_gdh_mps_lab.py` rather than delegating to `nanochat.double_helix`.
 
     Current probe ablation default:
-    - read_mute_floor=0.0 => pure sigmoid read-mute gate
+    - read-mute branch exists locally, but can be disabled with
+      `read_core.use_read_mute_gate = False`
     """
     bsz, n_tokens, d = local.shape
     assert sidecar_prev.shape[:2] == (bsz, n_tokens)
@@ -285,10 +285,7 @@ def _read_from_sidecar(
     z_proj = torch.matmul(z_read, read_core.W_o_read)                   # [B,N,D]
     if getattr(read_core, "use_read_mute_gate", True):
         read_mute = torch.sigmoid(torch.matmul(x_read, read_core.W_g_read_mute) + read_core.b_g_read_mute)
-        if read_mute_floor != 0.0:
-            read_mute = read_mute_floor + (1.0 - read_mute_floor) * read_mute
         z_proj = read_mute * z_proj
-
     return local + z_proj
 
 
@@ -357,12 +354,19 @@ def _make_run_label(args: argparse.Namespace, beta: float) -> str:
         f"__beta={beta:g}"
         f"__topk={args.route_topk}"
         f"__ubal={args.usage_balance_lambda:g}"
+        f"__rmg={int(bool(args.read_mute_gate))}"
+        f"__wb={int(bool(args.gdh_use_write_brain))}"
         f"__slots={args.gdh_slots}"
         f"__pairs={args.n_pairs}"
         f"__queries={args.n_queries}"
         f"__gap={args.gap_min}-{args.gap_max}"
         f"__seed={args.seed}"
     )
+
+
+def _config_payload(args: argparse.Namespace) -> dict[str, Any]:
+    cfg = dict(vars(args))
+    return cfg
 
 
 def _build_model(args: argparse.Namespace, device: str) -> GPT:
@@ -386,8 +390,8 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
         arch=args.arch,
         gdh_slots=args.gdh_slots,
         gdh_write_heads=args.gdh_write_heads,
-        gdh_use_write_brain=True,
-        gdh_write_brain_hidden_mult=4,
+        gdh_use_write_brain=args.gdh_use_write_brain,
+        gdh_write_brain_hidden_mult=args.gdh_write_brain_hidden_mult,
     )
 
     if args.swa_window > 0:
@@ -398,10 +402,13 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
     model.init_weights()
 
     # Mild warm-start for early GDH read mixing in the reduced lab setup.
+    # Probe default keeps read-mute disabled unless explicitly re-enabled.
     if args.arch == "gdh":
         with torch.no_grad():
             for i in range(min(2, len(model.gdh_read))):
                 torch.nn.init.normal_(model.gdh_read[i].W_o_read, mean=0.0, std=0.02)
+            for read_core in model.gdh_read:
+                read_core.use_read_mute_gate = bool(args.read_mute_gate)
 
     return model
 
@@ -537,7 +544,7 @@ def _forward_gdh(
 
     for i, block in enumerate(model.transformer.h):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
-        x = _read_from_sidecar(model.gdh_read[i], x, sidecar, eps=1e-6, read_mute_floor=0.0)
+        x = _read_from_sidecar(model.gdh_read[i], x, sidecar, eps=1e-6)
         ve = model.value_embeds[str(i)](idx) if str(i) in model.value_embeds else None
         x = block(x, ve, cos_sin, model.window_sizes[i], kv_cache=None)
 
@@ -747,7 +754,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         if getattr(args, "live_json", ""):
             try:
                 live_payload = {
-                    "config": vars(args),
+                    "config": _config_payload(args),
                     "beta": beta,
                     "run_label": run_label,
                     "history": history,
@@ -914,8 +921,21 @@ def main() -> None:
 
     p.add_argument("--gdh-slots", type=int, default=8)
     p.add_argument("--gdh-write-heads", type=int, default=8)
+    p.add_argument(
+        "--gdh-use-write-brain",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable probe-local write-brain residual MLP (default: off)",
+    )
+    p.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4)
     p.add_argument("--route-topk", type=int, default=0)
     p.add_argument("--usage-balance-lambda", type=float, default=0.0)
+    p.add_argument(
+        "--read-mute-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable probe-local read-mute gate (default: off)",
+    )
 
     p.add_argument("--swa-window", type=int, default=0, help="Sliding window size (0=off). If set, forces SWA on all layers.")
 
@@ -983,7 +1003,7 @@ def main() -> None:
         })
 
     payload = {
-        "config": vars(args),
+        "config": _config_payload(args),
         "betas": betas,
         "summary": summary_rows,
         "runs": runs,

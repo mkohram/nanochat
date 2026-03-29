@@ -4,6 +4,11 @@ set -euo pipefail
 # Canonical EASY blindfold probe config for Apple Silicon / MPS.
 # Uses the MPS-tuned lab harness, defaults MPS autocast to bfloat16,
 # enables torch.compile, and logs every 50 steps by default.
+# Probe defaults now use the simplified GDH path:
+# - read-mute gate off
+# - write brain off
+# - single write head
+# Pass flags through "$@" to re-enable ablations.
 
 cd "$(dirname "$0")/.."
 
@@ -32,7 +37,7 @@ exec "$PY" experiments/mqar_gdh_mps_lab.py \
   --n-head 4 \
   --n-embd 64 \
   --gdh-slots 8 \
-  --gdh-write-heads 8 \
+  --gdh-write-heads 1 \
   --route-topk 4 \
   --usage-balance-lambda 0.01 \
   --swa-window 8 \

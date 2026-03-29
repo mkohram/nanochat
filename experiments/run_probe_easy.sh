@@ -31,7 +31,7 @@ exec "$PY" experiments/mqar_gdh_lab.py \
   --n-head 4 \
   --n-embd 64 \
   --gdh-slots 8 \
-  --gdh-write-heads 8 \
+  --gdh-write-heads 1 \
   --route-topk 4 \
   --usage-balance-lambda 0.01 \
   --swa-window 8 \
