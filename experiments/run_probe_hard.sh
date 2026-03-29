@@ -49,6 +49,7 @@ exec "$PY" experiments/mqar_gdh_lab.py \
   --gdh-slots 8 \
   --gdh-write-heads 1 \
   --route-topk 4 \
+  --write-routing static \
   --swa-window 8 \
   --n-pairs 16 \
   --n-queries 8 \

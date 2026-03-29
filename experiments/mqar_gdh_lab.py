@@ -102,6 +102,7 @@ def _slot_stats_last(sidecar: torch.Tensor, eps: float = 1e-9) -> dict[str, floa
     r = gram.shape[-1]
     eye = torch.eye(r, dtype=torch.bool, device=gram.device)
     offdiag = gram[:, ~eye]
+    offdiag_cpu = offdiag.to(torch.float32).cpu()
 
     usage = norms / norms.sum(dim=-1, keepdim=True).clamp_min(eps)
     entropy = -(usage.clamp_min(eps) * usage.clamp_min(eps).log()).sum(dim=-1)
@@ -119,6 +120,7 @@ def _slot_stats_last(sidecar: torch.Tensor, eps: float = 1e-9) -> dict[str, floa
     return {
         "slot_cos_mean": float(offdiag.mean().item()),
         "slot_cos_max": float(offdiag.max(dim=-1).values.mean().item()),
+        "slot_cos_p90": float(torch.quantile(offdiag_cpu, 0.90, dim=-1).mean().item()),
         "effective_slots": float(effective_slots.mean().item()),
         "max_share": float(max_share.mean().item()),
         "participation_ratio": float(participation_ratio.mean().item()),
@@ -196,32 +198,56 @@ def _compute_answer_metrics(logits: torch.Tensor, targets: torch.Tensor, eval_to
 def _write_delta(
     write_core,
     local_out: torch.Tensor,
+    sidecar_prev: torch.Tensor,
     *,
     n_write_heads: int,
     route_topk: int,
+    routing_mode: str,
     eps: float,
 ) -> torch.Tensor:
     """Reduced GDH write path used by this lab harness.
+
+    Routing ablations:
+      - static: learned slot addresses only
+      - content: current sidecar contents only
+      - hybrid: static + content logits
 
     Returns:
       delta: [B,N,R,D]
     """
     bsz, n_tokens, d = local_out.shape
-    r = write_core.E_slots.shape[0]
+    assert sidecar_prev.shape[:2] == (bsz, n_tokens)
+    r = sidecar_prev.shape[2]
+    assert write_core.E_slots.shape[0] == r, "sidecar slot count must match E_slots"
     d_h = d // n_write_heads
 
     x_write = _rms_norm(local_out, eps=eps)
     k_upd = torch.matmul(x_write, write_core.W_k_write)
     v_upd = torch.matmul(x_write, write_core.W_v_write)
 
-    e_slots = _rms_norm(write_core.E_slots, eps=eps)
-    q_slots = torch.matmul(e_slots, write_core.W_q_slots_global)
-
-    q_h = q_slots.view(r, n_write_heads, d_h)
     k_h = k_upd.view(bsz, n_tokens, n_write_heads, d_h)
     v_h = v_upd.view(bsz, n_tokens, n_write_heads, d_h)
 
-    alpha = torch.softmax(torch.einsum("rhd,bnhd->bnhr", q_h, k_h) / math.sqrt(d_h), dim=-1)
+    logits = None
+
+    if routing_mode in {"static", "hybrid"}:
+        e_slots = _rms_norm(write_core.E_slots, eps=eps)
+        q_slots_static = torch.matmul(e_slots, write_core.W_q_slots_global)
+        q_static_h = q_slots_static.view(r, n_write_heads, d_h)
+        logits_static = torch.einsum("rhd,bnhd->bnhr", q_static_h, k_h) / math.sqrt(d_h)
+        logits = logits_static if logits is None else logits + logits_static
+
+    if routing_mode in {"content", "hybrid"}:
+        s_slots = _rms_norm(sidecar_prev, eps=eps)
+        q_slots_content = torch.einsum("bnrd,df->bnrf", s_slots, write_core.W_q_slots_global)
+        q_content_h = q_slots_content.view(bsz, n_tokens, r, n_write_heads, d_h)
+        logits_content = torch.einsum("bnrhd,bnhd->bnhr", q_content_h, k_h) / math.sqrt(d_h)
+        logits = logits_content if logits is None else logits + logits_content
+
+    if logits is None:
+        raise ValueError(f"unknown routing_mode: {routing_mode}")
+
+    alpha = torch.softmax(logits, dim=-1)
 
     if route_topk > 0 and route_topk < r:
         top_idx = torch.topk(alpha, k=route_topk, dim=-1).indices
@@ -243,6 +269,7 @@ def _make_run_label(args: argparse.Namespace, beta: float) -> str:
         f"arch={args.arch}"
         f"__beta={beta:g}"
         f"__topk={args.route_topk}"
+        f"__wroute={args.write_routing}"
         f"__slots={args.gdh_slots}"
         f"__pairs={args.n_pairs}"
         f"__queries={args.n_queries}"
@@ -382,6 +409,7 @@ def _forward_gdh(
     *,
     scan_beta: float,
     route_topk: int,
+    write_routing: str,
     eval_topk: int,
     collect_sidecar: bool,
 ):
@@ -399,6 +427,7 @@ def _forward_gdh(
 
     layer_slot_cos = []
     layer_slot_cos_max = []
+    layer_slot_cos_p90 = []
     layer_effective_slots = []
     layer_max_share = []
     layer_participation_ratio = []
@@ -417,8 +446,10 @@ def _forward_gdh(
         delta = _write_delta(
             model.gdh_write[i],
             x,
+            sidecar,
             n_write_heads=gdh_heads,
             route_topk=route_topk,
+            routing_mode=write_routing,
             eps=1e-6,
         )
 
@@ -428,6 +459,7 @@ def _forward_gdh(
             slot_stats = _slot_stats_last(sidecar)
             layer_slot_cos.append(slot_stats["slot_cos_mean"])
             layer_slot_cos_max.append(slot_stats["slot_cos_max"])
+            layer_slot_cos_p90.append(slot_stats["slot_cos_p90"])
             layer_effective_slots.append(slot_stats["effective_slots"])
             layer_max_share.append(slot_stats["max_share"])
             layer_participation_ratio.append(slot_stats["participation_ratio"])
@@ -450,6 +482,7 @@ def _forward_gdh(
         stats = {
             "slot_cos_mean_last_per_layer": layer_slot_cos,
             "slot_cos_max_last_per_layer": layer_slot_cos_max,
+            "slot_cos_p90_last_per_layer": layer_slot_cos_p90,
             "slot_usage_effective_slots_last_per_layer": layer_effective_slots,
             "slot_usage_max_share_last_per_layer": layer_max_share,
             "slot_participation_ratio_last_per_layer": layer_participation_ratio,
@@ -526,6 +559,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                         eval_tgt,
                         scan_beta=beta,
                         route_topk=args.route_topk,
+                        write_routing=args.write_routing,
                         eval_topk=args.eval_topk,
                         collect_sidecar=True,
                     )
@@ -549,6 +583,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             rec["slot_cos_l_last"] = float(stats["slot_cos_mean_last_per_layer"][-1])
             rec["slot_cos_layers"] = [float(v) for v in stats["slot_cos_mean_last_per_layer"]]
             rec["slot_cos_max_layers"] = [float(v) for v in stats["slot_cos_max_last_per_layer"]]
+            rec["slot_cos_p90_layers"] = [float(v) for v in stats["slot_cos_p90_last_per_layer"]]
             rec["slot_usage_effective_slots_layers"] = [float(v) for v in stats["slot_usage_effective_slots_last_per_layer"]]
             rec["slot_usage_max_share_layers"] = [float(v) for v in stats["slot_usage_max_share_last_per_layer"]]
             rec["slot_participation_ratio_layers"] = [float(v) for v in stats["slot_participation_ratio_last_per_layer"]]
@@ -564,6 +599,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             rec["slot_cos_l_last"] = None
             rec["slot_cos_layers"] = []
             rec["slot_cos_max_layers"] = []
+            rec["slot_cos_p90_layers"] = []
             rec["slot_usage_effective_slots_layers"] = []
             rec["slot_usage_max_share_layers"] = []
             rec["slot_participation_ratio_layers"] = []
@@ -639,6 +675,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                     tgt,
                     scan_beta=beta,
                     route_topk=args.route_topk,
+                    write_routing=args.write_routing,
                     eval_topk=args.eval_topk,
                     collect_sidecar=False,
                 )
@@ -751,6 +788,7 @@ def main() -> None:
     p.add_argument("--gdh-slots", type=int, default=8)
     p.add_argument("--gdh-write-heads", type=int, default=8)
     p.add_argument("--route-topk", type=int, default=0)
+    p.add_argument("--write-routing", type=str, default="static", choices=["static", "content", "hybrid"], help="write routing source: learned slot addresses, current sidecar contents, or both")
 
     p.add_argument("--swa-window", type=int, default=0, help="Sliding window size (0=off). If set, forces SWA on all layers.")
 

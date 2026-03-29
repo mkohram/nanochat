@@ -24,6 +24,7 @@ export type ProbeHistoryPoint = {
   slot_cos_l_last?: number | null
   slot_cos_layers?: number[]
   slot_cos_max_layers?: number[]
+  slot_cos_p90_layers?: number[]
   slot_usage_effective_slots_layers?: number[]
   slot_usage_max_share_layers?: number[]
   slot_participation_ratio_layers?: number[]

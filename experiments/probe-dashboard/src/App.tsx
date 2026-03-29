@@ -32,7 +32,7 @@ function compactConfig(cfg?: Record<string, unknown>): string {
     'arch','betas','steps','log_every','seed','sequence_len','vocab_size',
     'n_layer','n_head','n_embd','gdh_slots','gdh_write_heads',
     'gdh_use_write_brain','gdh_write_brain_hidden_mult','read_mute_gate',
-    'route_topk','swa_window','n_pairs','n_queries',
+    'route_topk','write_routing','swa_window','n_pairs','n_queries',
     'gap_min','gap_max','batch_size','eval_batch_size','lr','lr_decay_iters','min_lr','device',
   ]
   return keys.filter((k) => cfg[k] !== undefined).map((k) => `${k}=${String(cfg[k])}`).join(' | ')
@@ -96,6 +96,26 @@ function layerSeries(history: ProbeHistoryPoint[], key: string) {
     for (let i = 0; i < maxLayers; i += 1) {
       const arr = row[key]
       out[`layer_${i}`] = Array.isArray(arr) && typeof arr[i] === 'number' ? (arr[i] as number) : null
+    }
+    return out
+  })
+}
+
+function layerSeriesDual(history: ProbeHistoryPoint[], keyA: string, keyB: string) {
+  const maxLayers = history.reduce((acc, row) => {
+    const arrA = row[keyA]
+    const arrB = row[keyB]
+    const nA = Array.isArray(arrA) ? arrA.length : 0
+    const nB = Array.isArray(arrB) ? arrB.length : 0
+    return Math.max(acc, nA, nB)
+  }, 0)
+  return history.map((row) => {
+    const out: Record<string, number | null> = { step: row.step }
+    for (let i = 0; i < maxLayers; i += 1) {
+      const arrA = row[keyA]
+      const arrB = row[keyB]
+      out[`layer_${i}_max`] = Array.isArray(arrA) && typeof arrA[i] === 'number' ? (arrA[i] as number) : null
+      out[`layer_${i}_p90`] = Array.isArray(arrB) && typeof arrB[i] === 'number' ? (arrB[i] as number) : null
     }
     return out
   })
@@ -319,6 +339,7 @@ export function App() {
   ], 0.06)
   const histData = histOverlayData(last?.out_state_hist_layers)
   const histLayerCount = last?.out_state_hist_layers?.length ?? 0
+  const slotCosMaxP90Data = layerSeriesDual(history, 'slot_cos_max_layers', 'slot_cos_p90_layers')
   const availableHeatmapLayers = Math.max(last?.sidecar_norm_trace_layers?.length ?? 0, last?.sidecar_last_layers?.length ?? 0)
   const selectedHeatmapLayer = Math.min(heatmapLayer, Math.max(0, availableHeatmapLayers - 1))
   const sidecarNormTrace = (last?.sidecar_norm_trace_layers?.[selectedHeatmapLayer] as number[][] | undefined) ?? []
@@ -447,9 +468,28 @@ export function App() {
 
       <div className="section-title">Collapse</div>
       <div className="chart-grid two-up">
+        <Panel title="Layer-wise slot cosine (max and p90 off-diag)">
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <LineChart data={slotCosMaxP90Data}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="step" />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                {Object.keys(slotCosMaxP90Data[0] ?? {}).filter((k) => k.startsWith('layer_') && k.endsWith('_max')).map((seriesKey, idx) => {
+                  const layerKey = seriesKey.replace(/_max$/, '')
+                  return [
+                    <Line key={seriesKey} type="monotone" dataKey={seriesKey} name={`${layerKey} max`} stroke={LAYER_COLORS[idx % LAYER_COLORS.length]} dot={false} />,
+                    <Line key={`${layerKey}_p90`} type="monotone" dataKey={`${layerKey}_p90`} name={`${layerKey} p90`} stroke={LAYER_COLORS[idx % LAYER_COLORS.length]} strokeDasharray="6 4" dot={false} />,
+                  ]
+                })}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
         {[
           ['Layer-wise slot cosine (mean off-diag)', 'slot_cos_layers'],
-          ['Layer-wise slot cosine (max off-diag)', 'slot_cos_max_layers'],
           ['Effective slots (exp entropy)', 'slot_usage_effective_slots_layers'],
           ['Max slot share', 'slot_usage_max_share_layers'],
           ['Participation ratio', 'slot_participation_ratio_layers'],
