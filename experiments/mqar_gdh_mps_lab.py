@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.gpt import GPT, GPTConfig, norm as gpt_norm
@@ -77,6 +78,94 @@ class WindowedGPT(GPT):
         # including the final layer, so attention cannot cheat across the gap.
         window = (self._swa_window, 0)
         return [window] * config.n_layer
+
+
+class LabGDHReadCore(nn.Module):
+    """Minimal GDH read core kept local to the lab harness."""
+
+    def __init__(self, d: int, *, use_read_mute_gate: bool = True):
+        super().__init__()
+        self.use_read_mute_gate = use_read_mute_gate
+        self.W_q_read = nn.Parameter(torch.empty(d, d))
+        self.W_k_read_global = nn.Parameter(torch.empty(d, d))
+        self.W_v_read_global = nn.Parameter(torch.empty(d, d))
+        self.W_o_read = nn.Parameter(torch.empty(d, d))
+        self.W_g_read_mute = nn.Parameter(torch.empty(d, 1))
+        self.b_g_read_mute = nn.Parameter(torch.zeros(1))
+
+    def reset_parameters(self, *, std: float, zero_init_mixer: bool) -> None:
+        del zero_init_mixer
+        s = math.sqrt(3.0) * std
+        nn.init.uniform_(self.W_q_read, -s, s)
+        nn.init.uniform_(self.W_k_read_global, -s, s)
+        nn.init.uniform_(self.W_v_read_global, -s, s)
+        nn.init.zeros_(self.W_g_read_mute)
+        nn.init.constant_(self.b_g_read_mute, -1.0)
+        nn.init.zeros_(self.W_o_read)
+
+
+class LabGDHWriteCore(nn.Module):
+    """Minimal GDH write core kept local to the lab harness."""
+
+    def __init__(
+        self,
+        d: int,
+        r: int,
+        *,
+        use_write_brain: bool = False,
+        write_brain_hidden_mult: int = 4,
+    ):
+        super().__init__()
+        if r <= 0:
+            raise ValueError("LabGDHWriteCore requires positive slot count r")
+        self.E_slots = nn.Parameter(torch.empty(r, d))
+        self.W_q_slots_global = nn.Parameter(torch.empty(d, d))
+        self.W_k_write = nn.Parameter(torch.empty(d, d))
+        self.W_v_write = nn.Parameter(torch.empty(d, d))
+        self.W_o_write = nn.Parameter(torch.empty(d, d))
+        self.use_write_brain = use_write_brain
+        self.write_brain_hidden_mult = write_brain_hidden_mult
+        if use_write_brain:
+            hidden = write_brain_hidden_mult * d
+            self.W_write_mlp_in_global = nn.Parameter(torch.empty(d, hidden))
+            self.W_write_mlp_out_global = nn.Parameter(torch.empty(hidden, d))
+        else:
+            self.register_parameter("W_write_mlp_in_global", None)
+            self.register_parameter("W_write_mlp_out_global", None)
+
+    def reset_parameters(self, *, std: float, zero_init_mixer: bool) -> None:
+        del zero_init_mixer
+        s = math.sqrt(3.0) * std
+        nn.init.uniform_(self.E_slots, -s, s)
+        nn.init.uniform_(self.W_q_slots_global, -s, s)
+        nn.init.uniform_(self.W_k_write, -s, s)
+        nn.init.uniform_(self.W_v_write, -s, s)
+        nn.init.uniform_(self.W_o_write, -s, s)
+        if self.use_write_brain and self.W_write_mlp_in_global is not None:
+            nn.init.uniform_(self.W_write_mlp_in_global, -s, s)
+            nn.init.zeros_(self.W_write_mlp_out_global)
+
+
+def _tie_gdh_global_weights_local(read_cores: nn.ModuleList, write_cores: nn.ModuleList) -> None:
+    if len(read_cores) <= 1:
+        return
+
+    shared_k_read = read_cores[0].W_k_read_global
+    shared_v_read = read_cores[0].W_v_read_global
+    shared_e_slots = write_cores[0].E_slots
+    shared_q_slots = write_cores[0].W_q_slots_global
+    shared_write_mlp_in = write_cores[0].W_write_mlp_in_global
+    shared_write_mlp_out = write_cores[0].W_write_mlp_out_global
+
+    for read_core in read_cores[1:]:
+        read_core.W_k_read_global = shared_k_read
+        read_core.W_v_read_global = shared_v_read
+    for write_core in write_cores[1:]:
+        write_core.E_slots = shared_e_slots
+        write_core.W_q_slots_global = shared_q_slots
+        if shared_write_mlp_in is not None:
+            write_core.W_write_mlp_in_global = shared_write_mlp_in
+            write_core.W_write_mlp_out_global = shared_write_mlp_out
 
 
 def _rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -411,12 +500,12 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
         n_kv_head=args.n_head,
         n_embd=args.n_embd,
         window_pattern="L",
-        arch=args.arch,
-        gdh_slots=args.gdh_slots,
-        gdh_write_heads=args.gdh_write_heads,
-        gdh_use_write_brain=args.gdh_use_write_brain,
-        gdh_write_brain_hidden_mult=args.gdh_write_brain_hidden_mult,
     )
+    cfg.arch = args.arch
+    cfg.gdh_slots = args.gdh_slots
+    cfg.gdh_write_heads = args.gdh_write_heads
+    cfg.gdh_use_write_brain = args.gdh_use_write_brain
+    cfg.gdh_write_brain_hidden_mult = args.gdh_write_brain_hidden_mult
 
     if args.swa_window > 0:
         model = WindowedGPT(cfg, swa_window=args.swa_window).to(device)
@@ -424,15 +513,44 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
         model = GPT(cfg).to(device)
 
     model.init_weights()
+    model.arch = args.arch
 
-    # Mild warm-start for early GDH read mixing in the reduced lab setup.
-    # Probe default keeps read-mute disabled unless explicitly re-enabled.
     if args.arch == "gdh":
+        model.gdh_read = nn.ModuleList([
+            LabGDHReadCore(model.config.n_embd, use_read_mute_gate=bool(args.read_mute_gate))
+            for _ in range(model.config.n_layer)
+        ]).to(device)
+        model.gdh_write = nn.ModuleList([
+            LabGDHWriteCore(
+                model.config.n_embd,
+                args.gdh_slots,
+                use_write_brain=bool(args.gdh_use_write_brain),
+                write_brain_hidden_mult=args.gdh_write_brain_hidden_mult,
+            )
+            for _ in range(model.config.n_layer)
+        ]).to(device)
+        _tie_gdh_global_weights_local(model.gdh_read, model.gdh_write)
+
+        gdh_std = model.config.n_embd ** -0.5
+        for read_core, write_core in zip(model.gdh_read, model.gdh_write):
+            read_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
+            write_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
+
+        compute_dtype = model.transformer.wte.weight.dtype
+        if compute_dtype != torch.float32:
+            model.gdh_read.to(dtype=compute_dtype)
+            model.gdh_write.to(dtype=compute_dtype)
+
+        # Mild warm-start for early GDH read mixing in the reduced lab setup.
+        # Probe default keeps read-mute disabled unless explicitly re-enabled.
         with torch.no_grad():
             for i in range(min(2, len(model.gdh_read))):
                 torch.nn.init.normal_(model.gdh_read[i].W_o_read, mean=0.0, std=0.02)
             for read_core in model.gdh_read:
                 read_core.use_read_mute_gate = bool(args.read_mute_gate)
+    else:
+        model.gdh_read = None
+        model.gdh_write = None
 
     return model
 
