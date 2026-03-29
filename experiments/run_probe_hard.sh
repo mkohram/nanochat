@@ -10,8 +10,24 @@ PY=".venv/bin/python"
 OUT_DIR="experiments/out"
 mkdir -p "$OUT_DIR"
 
+STEPS=5000
+for ((i = 1; i <= $#; i++)); do
+  arg="${!i}"
+  case "$arg" in
+    --steps)
+      j=$((i + 1))
+      if [ $j -le $# ]; then
+        STEPS="${!j}"
+      fi
+      ;;
+    --steps=*)
+      STEPS="${arg#--steps=}"
+      ;;
+  esac
+done
+
 TS="$(date +%Y%m%d_%H%M%S)"
-LOG="${OUT_DIR}/probe_hard_5k_${TS}.log"
+LOG="${OUT_DIR}/probe_hard_${STEPS}_${TS}.log"
 LIVE_JSON="${OUT_DIR}/probe_live.json"
 
 echo "$LOG" > "${OUT_DIR}/probe_current_log_path.txt"
@@ -32,9 +48,7 @@ exec "$PY" experiments/mqar_gdh_lab.py \
   --n-embd 128 \
   --gdh-slots 8 \
   --gdh-write-heads 1 \
-  --gdh-no-write-brain \
   --route-topk 4 \
-  --usage-balance-lambda 0.01 \
   --swa-window 8 \
   --n-pairs 16 \
   --n-queries 8 \

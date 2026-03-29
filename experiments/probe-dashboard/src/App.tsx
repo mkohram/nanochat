@@ -32,7 +32,7 @@ function compactConfig(cfg?: Record<string, unknown>): string {
     'arch','betas','steps','log_every','seed','sequence_len','vocab_size',
     'n_layer','n_head','n_embd','gdh_slots','gdh_write_heads',
     'gdh_use_write_brain','gdh_write_brain_hidden_mult','read_mute_gate',
-    'route_topk','usage_balance_lambda','swa_window','n_pairs','n_queries',
+    'route_topk','swa_window','n_pairs','n_queries',
     'gap_min','gap_max','batch_size','eval_batch_size','lr','lr_decay_iters','min_lr','device',
   ]
   return keys.filter((k) => cfg[k] !== undefined).map((k) => `${k}=${String(cfg[k])}`).join(' | ')

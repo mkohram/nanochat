@@ -298,24 +298,21 @@ def _apply_write_brain_local(write_core, delta: torch.Tensor, *, eps: float) -> 
     return delta + torch.matmul(hidden, write_core.W_write_mlp_out_global)
 
 
-def _write_delta_and_alpha(
+def _write_delta(
     write_core,
     local_out: torch.Tensor,
-    sidecar_prev: torch.Tensor,
     *,
     n_write_heads: int,
     route_topk: int,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Reduced GDH write path used by this lab harness.
 
     Returns:
       delta: [B,N,R,D]
-      alpha: [B,N,h,R] (hard/masked if top-k is enabled)
-      alpha_soft: [B,N,h,R] (soft/unmasked)
     """
     bsz, n_tokens, d = local_out.shape
-    r = sidecar_prev.shape[2]
+    r = write_core.E_slots.shape[0]
     d_h = d // n_write_heads
 
     x_write = _rms_norm(local_out, eps=eps)
@@ -329,9 +326,7 @@ def _write_delta_and_alpha(
     k_h = k_upd.view(bsz, n_tokens, n_write_heads, d_h)
     v_h = v_upd.view(bsz, n_tokens, n_write_heads, d_h)
 
-    logits = torch.einsum("rhd,bnhd->bnhr", q_h, k_h) / math.sqrt(d_h)
-    alpha_soft = torch.softmax(logits, dim=-1)
-    alpha = alpha_soft.clone()
+    alpha = torch.softmax(torch.einsum("rhd,bnhd->bnhr", q_h, k_h) / math.sqrt(d_h), dim=-1)
 
     if route_topk > 0 and route_topk < r:
         top_idx = torch.topk(alpha, k=route_topk, dim=-1).indices
@@ -345,7 +340,7 @@ def _write_delta_and_alpha(
     delta = torch.einsum("bnrd,df->bnrf", delta_raw, write_core.W_o_write)
     delta = _apply_write_brain_local(write_core, delta, eps=eps)
 
-    return delta, alpha, alpha_soft
+    return delta
 
 
 def _make_run_label(args: argparse.Namespace, beta: float) -> str:
@@ -353,7 +348,6 @@ def _make_run_label(args: argparse.Namespace, beta: float) -> str:
         f"arch={args.arch}"
         f"__beta={beta:g}"
         f"__topk={args.route_topk}"
-        f"__ubal={args.usage_balance_lambda:g}"
         f"__rmg={int(bool(args.read_mute_gate))}"
         f"__wb={int(bool(args.gdh_use_write_brain))}"
         f"__slots={args.gdh_slots}"
@@ -501,8 +495,7 @@ def _forward_baseline(
     logits = model(idx)
     ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
     metrics = _compute_answer_metrics(logits, targets, eval_topk=eval_topk, compute_topk=compute_topk, compute_mrr=compute_mrr)
-    zero = ce_loss.new_zeros(())
-    return ce_loss, ce_loss, zero, metrics, None
+    return ce_loss, ce_loss, metrics, None
 
 
 def _forward_gdh(
@@ -512,7 +505,6 @@ def _forward_gdh(
     *,
     scan_beta: float,
     route_topk: int,
-    usage_balance_lambda: float,
     eval_topk: int,
     collect_sidecar: bool,
     compute_topk: bool,
@@ -540,7 +532,6 @@ def _forward_gdh(
     layer_sidecar_norm_trace = []
     layer_sidecar_last = []
     layer_out_state_hist = []
-    usage_losses = []
 
     for i, block in enumerate(model.transformer.h):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
@@ -548,21 +539,13 @@ def _forward_gdh(
         ve = model.value_embeds[str(i)](idx) if str(i) in model.value_embeds else None
         x = block(x, ve, cos_sin, model.window_sizes[i], kv_cache=None)
 
-        delta, alpha, alpha_soft = _write_delta_and_alpha(
+        delta = _write_delta(
             model.gdh_write[i],
             x,
-            sidecar,
             n_write_heads=gdh_heads,
             route_topk=route_topk,
             eps=1e-6,
         )
-
-        # Usage balancing in the reduced probe uses soft routing only.
-        weighted_sum = alpha_soft.sum(dim=(0, 1, 2))
-        total_weight = alpha_soft.shape[0] * alpha_soft.shape[1] * alpha_soft.shape[2]
-        usage = weighted_sum / (total_weight + 1e-9)
-        usage_target = torch.full_like(usage, 1.0 / usage.shape[0])
-        usage_losses.append((usage - usage_target).pow(2).mean())
 
         sidecar = sidecar + _scan_accumulate(delta, scan_beta=scan_beta)
 
@@ -585,8 +568,7 @@ def _forward_gdh(
     logits = softcap * torch.tanh(logits / softcap)
 
     ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
-    usage_loss = torch.stack(usage_losses).mean() if usage_losses else ce_loss.new_zeros(())
-    total_loss = ce_loss + usage_balance_lambda * usage_loss
+    total_loss = ce_loss
 
     metrics = _compute_answer_metrics(logits, targets, eval_topk=eval_topk, compute_topk=compute_topk, compute_mrr=compute_mrr)
     if collect_sidecar:
@@ -604,7 +586,7 @@ def _forward_gdh(
         }
     else:
         stats = None
-    return total_loss, ce_loss, usage_loss, metrics, stats
+    return total_loss, ce_loss, metrics, stats
 
 
 def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str, Any]:
@@ -651,7 +633,6 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         step: int,
         train_total: float | None = None,
         train_ce: float | None = None,
-        train_usage: float | None = None,
         train_acc1: float | None = None,
         train_mrr: float | None = None,
     ):
@@ -664,7 +645,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         with torch.no_grad():
             with ac:
                 if args.arch == "baseline":
-                    eval_total, eval_ce, eval_usage, eval_metrics, stats = _forward_baseline(
+                    eval_total, eval_ce, eval_metrics, stats = _forward_baseline(
                         model,
                         eval_idx,
                         eval_tgt,
@@ -673,13 +654,12 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                         compute_mrr=full_metrics,
                     )
                 else:
-                    eval_total, eval_ce, eval_usage, eval_metrics, stats = _forward_gdh(
+                    eval_total, eval_ce, eval_metrics, stats = _forward_gdh(
                         model,
                         eval_idx,
                         eval_tgt,
                         scan_beta=beta,
                         route_topk=args.route_topk,
-                        usage_balance_lambda=args.usage_balance_lambda,
                         eval_topk=args.eval_topk,
                         collect_sidecar=True,
                         compute_topk=full_metrics,
@@ -687,7 +667,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                     )
 
         wall_time_s = time.perf_counter() - run_start_time
-        eval_scalars = torch.stack([eval_total.detach(), eval_ce.detach(), eval_usage.detach()]).cpu().tolist()
+        eval_scalars = torch.stack([eval_total.detach(), eval_ce.detach()]).cpu().tolist()
         rec: dict[str, Any] = {
             "step": step,
             "beta": beta,
@@ -697,7 +677,6 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             "wall_time_min": float(wall_time_s / 60.0),
             "eval_total": float(eval_scalars[0]),
             "eval_ce": float(eval_scalars[1]),
-            "eval_usage_loss": float(eval_scalars[2]),
             "eval_acc_top1": float(eval_metrics["acc_top1"]),
             "eval_mrr": None if eval_metrics["mrr"] is None else float(eval_metrics["mrr"]),
             "eval_n_answers": float(eval_metrics["n_answers"]),
@@ -742,8 +721,6 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             rec["train_total"] = float(train_total)
         if train_ce is not None:
             rec["train_ce"] = float(train_ce)
-        if train_usage is not None:
-            rec["train_usage_loss"] = float(train_usage)
         if train_acc1 is not None:
             rec["train_acc_top1"] = float(train_acc1)
         if train_mrr is not None:
@@ -791,7 +768,7 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         opt.zero_grad(set_to_none=True)
         with ac:
             if args.arch == "baseline":
-                total, ce, usage, train_metrics, _ = _forward_baseline(
+                total, ce, train_metrics, _ = _forward_baseline(
                     model,
                     idx,
                     tgt,
@@ -800,13 +777,12 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                     compute_mrr=False,
                 )
             else:
-                total, ce, usage, train_metrics, _ = _forward_gdh(
+                total, ce, train_metrics, _ = _forward_gdh(
                     model,
                     idx,
                     tgt,
                     scan_beta=beta,
                     route_topk=args.route_topk,
-                    usage_balance_lambda=args.usage_balance_lambda,
                     eval_topk=args.eval_topk,
                     collect_sidecar=False,
                     compute_topk=False,
@@ -820,7 +796,6 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                 step=step,
                 train_total=float(total.item()),
                 train_ce=float(ce.item()),
-                train_usage=float(usage.item()),
                 train_acc1=float(train_metrics["acc_top1"]),
                 train_mrr=None if train_metrics["mrr"] is None else float(train_metrics["mrr"]),
             )
@@ -929,7 +904,6 @@ def main() -> None:
     )
     p.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4)
     p.add_argument("--route-topk", type=int, default=0)
-    p.add_argument("--usage-balance-lambda", type=float, default=0.0)
     p.add_argument(
         "--read-mute-gate",
         action=argparse.BooleanOptionalAction,
