@@ -94,7 +94,7 @@ This file captures the *intent* behind GDH so implementation stays aligned even 
 
 ## MQAR probe-only extensions (current testbed)
 
-These are active in `experiments/mqar_scan_beta_probe.py` for Stage-1 blindfold experiments, but are **not** part of the canonical GDH spec yet.
+These were active in the archived Stage-1 blindfold probe `experiments/archive/scan-probe/mqar_scan_beta_probe.py`, but are **not** part of the canonical GDH spec yet.
 
 - **Sparse routing (`route_topk`)**
   - Applied post-softmax on slot routing weights, then renormalized.

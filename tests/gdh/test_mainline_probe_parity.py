@@ -9,7 +9,7 @@ from nanochat.gpt import GPT, GPTConfig
 
 def _load_probe_module():
     repo_root = Path(__file__).resolve().parents[2]
-    probe_path = repo_root / "experiments" / "mqar_scan_beta_probe.py"
+    probe_path = repo_root / "experiments" / "archive" / "scan-probe" / "mqar_scan_beta_probe.py"
     spec = importlib.util.spec_from_file_location("mqar_scan_beta_probe_mod", probe_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

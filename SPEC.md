@@ -5,7 +5,7 @@ Last updated: 2026-02-27
 This spec reflects the behavior currently implemented in:
 - `nanochat/gpt.py` (mainline GDH path)
 - `nanochat/double_helix.py` (GDH read/write cores)
-- `experiments/mqar_scan_beta_probe.py` (probe/testbed extensions)
+- `experiments/archive/scan-probe/mqar_scan_beta_probe.py` (archived probe/testbed extensions)
 
 ---
 
@@ -36,7 +36,7 @@ Canonical GDH architecture in current code path:
 - EMA state update (no additive-scan branch)
 - pre-tanh RMSNorm + final tanh on write delta
 
-Probe-only knobs (`mqar_scan_beta_probe.py`):
+Probe-only knobs (`experiments/archive/scan-probe/mqar_scan_beta_probe.py`):
 - `route_topk = K`
 - `usage_balance_lambda = λ_usage`
 - `scan_beta = β`
@@ -176,7 +176,7 @@ Mainline temporal update (canonical):
 
 ## 8) MQAR probe extensions (testbed-only, not canonical mainline)
 
-In `experiments/mqar_scan_beta_probe.py`:
+In `experiments/archive/scan-probe/mqar_scan_beta_probe.py`:
 
 1. **Probe GDH config forcing + read warm-start**
    - In `_build_model`, probe currently hard-sets `gdh_use_write_brain=True` and `gdh_write_brain_hidden_mult=4`.

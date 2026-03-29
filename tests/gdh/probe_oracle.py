@@ -1,6 +1,6 @@
 """Slow oracle for MQAR GDH probe behavior.
 
-This oracle mirrors the *probe path* in `experiments/mqar_scan_beta_probe.py`
+This oracle mirrors the archived *probe path* in `experiments/archive/scan-probe/mqar_scan_beta_probe.py`
 (including sparse top-k routing, gate-aware usage balancing, ad-hoc g_write,
 and leaky scan), but with explicit/slow computations where practical.
 """

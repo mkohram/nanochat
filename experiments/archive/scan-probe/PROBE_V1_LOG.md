@@ -232,7 +232,7 @@ We found two issues for GDH experiments under BOS best-fit packing:
 ## 2026-03-05: Minimal probe update + latest win (no write gate)
 
 ### Change
-- Simplified `experiments/mqar_scan_beta_probe_frozen_20260223.py` by removing probe write-gate path:
+- Simplified `experiments/archive/scan-probe/mqar_scan_beta_probe_frozen_20260223.py` by removing probe write-gate path:
   - removed ad-hoc `model.g_write_projs` injection
   - removed `gate_proj` plumbing in `_write_delta_and_alpha`
   - removed `--disable-write-gate` flag (no longer needed)
