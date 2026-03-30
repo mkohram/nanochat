@@ -469,6 +469,7 @@ def _make_run_label(args: argparse.Namespace, beta: float) -> str:
         f"__wroute={args.write_routing}"
         f"__rmg={int(bool(args.read_mute_gate))}"
         f"__wb={int(bool(args.gdh_use_write_brain))}"
+        f"__ve={int(bool(args.value_embeds))}"
         f"__slots={args.gdh_slots}"
         f"__pairs={args.n_pairs}"
         f"__queries={args.n_queries}"
@@ -514,6 +515,9 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
 
     model.init_weights()
     model.arch = args.arch
+
+    if not args.value_embeds:
+        model.value_embeds = nn.ModuleDict()
 
     if args.arch == "gdh":
         model.gdh_read = nn.ModuleList([
@@ -1063,6 +1067,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="enable probe-local read-mute gate (default: off)",
+    )
+    p.add_argument(
+        "--value-embeds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable transformer value embeddings from the mainline GPT trunk (default: on)",
     )
 
     p.add_argument("--swa-window", type=int, default=0, help="Sliding window size (0=off). If set, forces SWA on all layers.")
