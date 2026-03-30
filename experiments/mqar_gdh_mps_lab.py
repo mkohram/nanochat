@@ -142,7 +142,7 @@ class LabGDHWriteCore(nn.Module):
         nn.init.uniform_(self.W_v_write, -s, s)
         nn.init.uniform_(self.W_o_write, -s, s)
         if self.use_write_brain and self.W_write_mlp_in_global is not None:
-            nn.init.uniform_(self.W_write_mlp_in_global, -s, s)
+            nn.init.uniform_(self.W_write_mlp_in_global, -0.4 * s, 0.4 * s)
             nn.init.zeros_(self.W_write_mlp_out_global)
 
 
