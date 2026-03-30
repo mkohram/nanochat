@@ -25,6 +25,43 @@ Fresh experiment log for the reduced MQAR/GDH lab harness after the recent probe
 
 ## Experiment entries
 
+### 2026-03-29 — Entry 02 (ClimbMix hook for probe-side collapse audits)
+- Date/time: 2026-03-29
+- Hypothesis:
+  - Some apparent slot-collapse behavior may be specific to blindfolded MQAR geometry rather than a fully generic failure mode.
+  - The reduced GDH probe should be runnable on a small slice of the same BOS-packed pretraining data used by the mainline base model, so collapse telemetry can be inspected on real text as well as MQAR.
+- Change:
+  1. Added probe data-source switch:
+     - `--data-source {mqar,climbmix}`
+  2. Hooked `data_source=climbmix` into the existing mainline data path.
+     - Reused `nanochat.tokenizer.get_tokenizer()`
+     - Reused `nanochat.dataloader.tokenizing_distributed_data_loader_bos_bestfit(...)`
+     - Train batches now come from ClimbMix `train` split when requested.
+     - Eval batch now comes from ClimbMix `val` split when requested.
+  3. Added ClimbMix loader runtime knobs for the probe harness:
+     - `--base-tokenizer-threads`
+     - `--base-tokenizer-batch-size`
+     - `--base-buffer-size`
+  4. For `data_source=climbmix`, the probe now overrides `vocab_size` to the tokenizer vocabulary size so token ids from the real dataset fit the trunk embedding table.
+  5. Run labels now include `__data=...` so MQAR vs ClimbMix runs are easy to distinguish in logs/dashboard.
+  6. Dashboard compact config now shows `data_source`.
+- Command examples:
+  - MQAR easy default:
+    - `bash experiments/run_probe_easy_mps.sh`
+  - ClimbMix easy-shaped probe:
+    - `bash experiments/run_probe_easy_mps.sh --data-source climbmix --swa-window 0`
+  - ClimbMix hard-shaped blindfolded probe:
+    - `bash experiments/run_probe_hard_mps.sh --data-source climbmix`
+- Notes:
+  - MQAR-specific geometry checks remain enforced only for `data_source=mqar`.
+  - The probe still uses the reduced GDH path and existing collapse telemetry on top of the mainline trunk.
+  - This change is intended as instrumentation / comparison support before trying stronger anti-collapse interventions.
+- Verdict:
+  - The probe can now compare synthetic recall geometry against real pretraining text without adding a second custom dataset path.
+- Next:
+  - Run short ClimbMix GDH and baseline checks.
+  - Compare slot participation ratio / max-share trajectories between MQAR and ClimbMix.
+
 ### 2026-03-29 — Entry 01 (probe minimization + write-routing ablation scaffold)
 - Date/time: 2026-03-29
 - Hypothesis:

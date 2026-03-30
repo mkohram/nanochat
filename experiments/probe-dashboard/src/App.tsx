@@ -29,7 +29,7 @@ function fmt(v: unknown, digits = 4): string {
 function compactConfig(cfg?: Record<string, unknown>): string {
   if (!cfg) return 'No config loaded.'
   const keys = [
-    'arch','betas','steps','log_every','seed','sequence_len','vocab_size',
+    'arch','data_source','betas','steps','log_every','seed','sequence_len','vocab_size',
     'n_layer','n_head','n_embd','gdh_slots','gdh_write_heads',
     'gdh_use_write_brain','gdh_write_brain_hidden_mult','read_mute_gate',
     'route_topk','write_routing','swa_window','n_pairs','n_queries',
@@ -60,6 +60,12 @@ function paddedDomain(values: Array<number | null | undefined>, padFrac = 0.08):
   return [lo - pad, hi + pad]
 }
 
+function paddedPositiveDomain(values: Array<number | null | undefined>, padFrac = 0.08, minLo = 1): [number, number] | undefined {
+  const domain = paddedDomain(values, padFrac)
+  if (!domain) return undefined
+  return [Math.max(minLo, domain[0]), Math.max(minLo, domain[1])]
+}
+
 function carryForward(values: Array<number | null | undefined>): Array<number | null> {
   let last: number | null = null
   return values.map((v) => {
@@ -84,6 +90,10 @@ function vocabRandomMRR(vocabSize: unknown): number | null {
   let h = 0
   for (let i = 1; i <= vocabSize; i += 1) h += 1 / i
   return h / vocabSize
+}
+
+function ceToPpl(ce: unknown): number | null {
+  return typeof ce === 'number' && Number.isFinite(ce) ? Math.exp(ce) : null
 }
 
 function layerSeries(history: ProbeHistoryPoint[], key: string) {
@@ -291,6 +301,7 @@ export function App() {
   const [live, setLive] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [heatmapLayer, setHeatmapLayer] = useState(0)
+  const [yAxisIgnoreFirst, setYAxisIgnoreFirst] = useState(0)
 
   const load = async () => {
     setStatus('loading')
@@ -321,22 +332,33 @@ export function App() {
 
   const rawEvalMrr = history.map((row) => (typeof row.eval_mrr === 'number' ? row.eval_mrr : null))
   const shownEvalMrr = carryForward(rawEvalMrr)
-  const learningData = history.map((row, i) => ({
-    step: row.step,
-    wall_time_min: typeof row.wall_time_min === 'number' ? row.wall_time_min : null,
-    eval_acc_top1: typeof row.eval_acc_top1 === 'number' ? row.eval_acc_top1 : null,
-    eval_mrr: shownEvalMrr[i],
-    eval_ce: typeof row.eval_ce === 'number' ? row.eval_ce : null,
-    train_ce: typeof row.train_ce === 'number' ? row.train_ce : null,
-    full_metrics: Boolean(row.full_metrics),
-  }))
-  const randomCe = vocabRandomCE(payload?.config?.vocab_size)
+  const learningData = history.map((row, i) => {
+    const evalCe = typeof row.eval_ce === 'number' ? row.eval_ce : null
+    const trainCe = typeof row.train_ce === 'number' ? row.train_ce : null
+    return {
+      step: row.step,
+      wall_time_min: typeof row.wall_time_min === 'number' ? row.wall_time_min : null,
+      eval_acc_top1: typeof row.eval_acc_top1 === 'number' ? row.eval_acc_top1 : null,
+      eval_mrr: shownEvalMrr[i],
+      eval_ce: evalCe,
+      train_ce: trainCe,
+      eval_ppl: ceToPpl(evalCe),
+      train_ppl: ceToPpl(trainCe),
+      full_metrics: Boolean(row.full_metrics),
+    }
+  })
   const randomTop1 = vocabRandomTop1(payload?.config?.vocab_size)
   const randomMrr = vocabRandomMRR(payload?.config?.vocab_size)
-  const ceDomain = paddedDomain([
-    ...learningData.flatMap((row) => [row.eval_ce, row.train_ce]),
-    randomCe,
-  ], 0.06)
+  const domainData = learningData.slice(Math.max(0, Math.min(yAxisIgnoreFirst, Math.max(0, learningData.length - 1))))
+  const ceDomain = paddedDomain(
+    domainData.flatMap((row) => [row.eval_ce, row.train_ce]),
+    0.06,
+  )
+  const pplDomain = paddedPositiveDomain(
+    domainData.flatMap((row) => [row.eval_ppl, row.train_ppl]),
+    0.06,
+    1,
+  )
   const histData = histOverlayData(last?.out_state_hist_layers)
   const histLayerCount = last?.out_state_hist_layers?.length ?? 0
   const slotCosMaxP90Data = layerSeriesDual(history, 'slot_cos_max_layers', 'slot_cos_p90_layers')
@@ -378,6 +400,7 @@ export function App() {
         <StatCard title="Wall time" value={fmt(last?.wall_time_min, 2)} subtitle="minutes" />
         <StatCard title="Eval top1" value={fmt(last?.eval_acc_top1)} subtitle={`MRR ${fmt(last?.eval_mrr)}`} />
         <StatCard title="Eval CE" value={fmt(last?.eval_ce)} subtitle={`Train CE ${fmt(last?.train_ce)}`} />
+        <StatCard title="Eval PPL" value={fmt(ceToPpl(last?.eval_ce), 2)} subtitle={`Train PPL ${fmt(ceToPpl(last?.train_ce), 2)}`} />
         <StatCard title="Slot cosine" value={fmt(last?.slot_cos_l_last)} subtitle="last layer" />
         <StatCard title="Out abs max" value={fmt(last?.out_state_stats?.abs_max)} subtitle={`std ${fmt(last?.out_state_stats?.std)}`} />
       </div>
@@ -387,6 +410,39 @@ export function App() {
       </Panel>
 
       <div className="section-title">Learning</div>
+      <div className="learning-toolbar">
+        <div className="axis-control-card">
+          <div className="axis-control-copy">
+            <div className="axis-control-title">Y-axis autoscale</div>
+            <div className="axis-control-subtitle">Ignore the first N points for CE / perplexity domain selection.</div>
+          </div>
+          <div className="axis-control-actions">
+            <div className="axis-control-presets">
+              {[0, 10, 50, 200, 1000].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  className={`pill-button${yAxisIgnoreFirst === n ? ' is-active' : ''}`}
+                  onClick={() => setYAxisIgnoreFirst(n)}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+            <label className="axis-control-input-wrap">
+              <span className="axis-control-input-label">Custom</span>
+              <input
+                className="axis-control-input"
+                type="number"
+                min={0}
+                step={1}
+                value={yAxisIgnoreFirst}
+                onChange={(e) => setYAxisIgnoreFirst(Math.max(0, Number.parseInt(e.target.value || '0', 10) || 0))}
+              />
+            </label>
+          </div>
+        </div>
+      </div>
       <div className="chart-grid two-up">
         <Panel title="Eval top-1 / MRR">
           <div className="chart-wrap">
@@ -446,20 +502,27 @@ export function App() {
               <LineChart data={learningData}>
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="step" />
-                <YAxis domain={ceDomain ?? ['auto', 'auto']} tickFormatter={(v) => fmt(v, 2)} width={54} />
+                <YAxis domain={ceDomain ?? ['auto', 'auto']} tickFormatter={(v) => fmt(v, 2)} width={54} allowDataOverflow />
                 <Tooltip formatter={(value: unknown) => fmt(value, 3)} />
                 <Legend />
-                {randomCe !== null ? (
-                  <ReferenceLine
-                    y={randomCe}
-                    stroke="#64748b"
-                    strokeDasharray="6 4"
-                    ifOverflow="extendDomain"
-                    label={{ value: `random ${fmt(randomCe, 3)}`, position: 'insideTopRight', fill: '#475569', fontSize: 12 }}
-                  />
-                ) : null}
                 <Line type="monotone" dataKey="eval_ce" name="eval_ce" stroke="#dc2626" dot={false} strokeWidth={2} />
                 <Line type="monotone" dataKey="train_ce" name="train_ce" stroke="#0ea5e9" dot={false} strokeWidth={2} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
+
+        <Panel title="Train vs eval perplexity">
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <LineChart data={learningData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="step" />
+                <YAxis domain={pplDomain ?? [1, 'auto']} tickFormatter={(v) => fmt(v, 0)} width={64} allowDecimals={false} allowDataOverflow />
+                <Tooltip formatter={(value: unknown) => fmt(value, 2)} />
+                <Legend />
+                <Line type="monotone" dataKey="eval_ppl" name="eval_ppl" stroke="#b91c1c" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="train_ppl" name="train_ppl" stroke="#0284c7" dot={false} strokeWidth={2} />
               </LineChart>
             </ResponsiveContainer>
           </div>

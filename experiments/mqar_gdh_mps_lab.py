@@ -38,7 +38,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.gpt import GPT, GPTConfig, norm as gpt_norm
+from nanochat.tokenizer import get_tokenizer
 
 
 def _default_device() -> str:
@@ -470,6 +472,7 @@ def _make_run_label(args: argparse.Namespace, beta: float) -> str:
         f"__rmg={int(bool(args.read_mute_gate))}"
         f"__wb={int(bool(args.gdh_use_write_brain))}"
         f"__ve={int(bool(args.value_embeds))}"
+        f"__data={args.data_source}"
         f"__slots={args.gdh_slots}"
         f"__pairs={args.n_pairs}"
         f"__queries={args.n_queries}"
@@ -630,6 +633,20 @@ def make_mqar_batch(args: argparse.Namespace, batch_size: int, device: str):
     return idx, targets
 
 
+def make_base_data_iter(args: argparse.Namespace, batch_size: int, device: str, split: str):
+    tokenizer = get_tokenizer()
+    return tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer,
+        batch_size,
+        args.sequence_len,
+        split,
+        tokenizer_threads=args.base_tokenizer_threads,
+        tokenizer_batch_size=args.base_tokenizer_batch_size,
+        device=device,
+        buffer_size=args.base_buffer_size,
+    )
+
+
 def _forward_baseline(
     model: GPT,
     idx: torch.Tensor,
@@ -777,7 +794,13 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
     ac = _make_autocast(device, args.amp_dtype)
 
     torch.manual_seed(args.seed + 1)
-    eval_idx, eval_tgt = make_mqar_batch(args, batch_size=args.eval_batch_size, device=device)
+    train_data_iter = None
+    if args.data_source == "mqar":
+        eval_idx, eval_tgt = make_mqar_batch(args, batch_size=args.eval_batch_size, device=device)
+    else:
+        train_data_iter = make_base_data_iter(args, batch_size=args.batch_size, device=device, split="train")
+        eval_data_iter = make_base_data_iter(args, batch_size=args.eval_batch_size, device=device, split="val")
+        eval_idx, eval_tgt = next(eval_data_iter)
 
     history: list[dict[str, Any]] = []
     run_start_time = time.perf_counter()
@@ -919,7 +942,10 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         for group in opt.param_groups:
             group["lr"] = lr_t
 
-        idx, tgt = make_mqar_batch(args, batch_size=args.batch_size, device=device)
+        if args.data_source == "mqar":
+            idx, tgt = make_mqar_batch(args, batch_size=args.batch_size, device=device)
+        else:
+            idx, tgt = next(train_data_iter)
 
         opt.zero_grad(set_to_none=True)
         with ac:
@@ -1074,6 +1100,16 @@ def main() -> None:
         default=True,
         help="enable transformer value embeddings from the mainline GPT trunk (default: on)",
     )
+    p.add_argument(
+        "--data-source",
+        type=str,
+        default="mqar",
+        choices=["mqar", "climbmix"],
+        help="training/eval batch source: synthetic MQAR probe batches or the mainline ClimbMix pretraining dataset",
+    )
+    p.add_argument("--base-tokenizer-threads", type=int, default=4)
+    p.add_argument("--base-tokenizer-batch-size", type=int, default=128)
+    p.add_argument("--base-buffer-size", type=int, default=1000)
 
     p.add_argument("--swa-window", type=int, default=0, help="Sliding window size (0=off). If set, forces SWA on all layers.")
 
@@ -1103,16 +1139,22 @@ def main() -> None:
     p.add_argument("--live-json", type=str, default="", help="optional path to continuously write live metrics JSON")
     args = p.parse_args()
 
-    if args.n_queries > args.n_pairs:
-        raise ValueError("n_queries must be <= n_pairs")
-    if args.query_offset + args.key_vocab > args.vocab_size:
-        raise ValueError("query token range exceeds vocab_size")
-    if args.filler_offset + args.filler_vocab > args.vocab_size:
-        raise ValueError("filler token range exceeds vocab_size")
-    if args.arch == "gdh" and args.enforce_capacity_stress and args.n_pairs <= args.gdh_slots:
-        raise ValueError("capacity stress requested but n_pairs <= gdh_slots")
-    if args.swa_window > 0 and args.gap_min <= args.swa_window:
-        raise ValueError(f"gap_min ({args.gap_min}) must be > swa_window ({args.swa_window}) to ensure blindfold")
+    if args.data_source == "climbmix":
+        tokenizer = get_tokenizer()
+        args.vocab_size = tokenizer.get_vocab_size()
+        print(f"[info] data_source=climbmix -> overriding vocab_size to tokenizer vocab {args.vocab_size}", flush=True)
+
+    if args.data_source == "mqar":
+        if args.n_queries > args.n_pairs:
+            raise ValueError("n_queries must be <= n_pairs")
+        if args.query_offset + args.key_vocab > args.vocab_size:
+            raise ValueError("query token range exceeds vocab_size")
+        if args.filler_offset + args.filler_vocab > args.vocab_size:
+            raise ValueError("filler token range exceeds vocab_size")
+        if args.arch == "gdh" and args.enforce_capacity_stress and args.n_pairs <= args.gdh_slots:
+            raise ValueError("capacity stress requested but n_pairs <= gdh_slots")
+        if args.swa_window > 0 and args.gap_min <= args.swa_window:
+            raise ValueError(f"gap_min ({args.gap_min}) must be > swa_window ({args.swa_window}) to ensure blindfold")
 
     if args.arch == "baseline" and args.route_topk != 0:
         print("[warn] route_topk ignored for baseline arch", flush=True)

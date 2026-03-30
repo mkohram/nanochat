@@ -50,6 +50,82 @@ input, select {
 .meta-row { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 14px; color: #a9bbcf; }
 .error { color: #ff9da3; }
 
+.learning-toolbar { margin-bottom: 16px; }
+.axis-control-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 16px;
+  background: linear-gradient(180deg, rgba(18,32,53,0.95), rgba(10,18,31,0.95));
+  border: 1px solid #1e3554;
+  border-radius: 16px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.16);
+}
+.axis-control-copy {
+  min-width: 0;
+}
+.axis-control-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #e5eef8;
+}
+.axis-control-subtitle {
+  margin-top: 4px;
+  font-size: 0.84rem;
+  color: #9fb6cf;
+}
+.axis-control-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.axis-control-presets {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pill-button {
+  padding: 0.45rem 0.75rem;
+  border-radius: 999px;
+  background: #0d1828;
+  border-color: #27405f;
+  color: #bcd1e6;
+  line-height: 1;
+}
+.pill-button:hover {
+  background: #14243a;
+}
+.pill-button.is-active {
+  background: linear-gradient(180deg, #1d4ed8, #1e40af);
+  border-color: #3b82f6;
+  color: #eff6ff;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.12), 0 0 0 1px rgba(59,130,246,0.18);
+}
+.axis-control-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 12px;
+  background: #08101b;
+  border: 1px solid #27405f;
+  border-radius: 999px;
+  color: #cfe0f2;
+}
+.axis-control-input-label {
+  font-size: 0.82rem;
+  color: #9fb6cf;
+}
+.axis-control-input {
+  width: 88px;
+  padding: 0.45rem 0.7rem;
+  border-radius: 999px;
+  background: #0f1b2c;
+}
+
 .stats-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
 .stat-card { background: linear-gradient(180deg, #122035, #0d1828); border: 1px solid #1e3554; border-radius: 16px; padding: 14px; }
 .stat-title { color: #8ea6c3; font-size: 0.9rem; }
@@ -105,5 +181,12 @@ input, select {
 @media (max-width: 1280px) { .stats-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 900px) {
   .topbar { flex-direction: column; }
+  .axis-control-card {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .axis-control-actions {
+    justify-content: flex-start;
+  }
   .source-row, .two-up, .stats-grid { grid-template-columns: 1fr; }
 }
