@@ -8,6 +8,7 @@ set -euo pipefail
 # - read-mute gate off
 # - write brain off
 # - single write head
+# - normalized state mixer on
 # Pass flags through "$@" to re-enable ablations.
 
 cd "$(dirname "$0")/.."
@@ -54,7 +55,7 @@ exec "$PY" experiments/mqar_gdh_mps_lab.py \
   --n-embd 128 \
   --gdh-slots 8 \
   --gdh-write-heads 1 \
-  --route-topk 4 \
+  --route-topk 0 \
   --write-routing static \
   --swa-window 8 \
   --n-pairs 16 \
@@ -73,6 +74,6 @@ exec "$PY" experiments/mqar_gdh_mps_lab.py \
   --device mps \
   --amp-dtype auto \
   --compile \
-  --enforce-capacity-stress \
   --live-json "$LIVE_JSON" \
+  --state-mixer normalized \
   "$@" | tee "$LOG"

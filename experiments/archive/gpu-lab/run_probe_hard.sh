@@ -64,6 +64,5 @@ exec "$PY" experiments/archive/gpu-lab/mqar_gdh_lab.py \
   --eval-batch-size 8 \
   --eval-topk 5 \
   --lr 3e-4 \
-  --enforce-capacity-stress \
   --live-json "$LIVE_JSON" \
   "$@" | tee "$LOG"

@@ -25,6 +25,117 @@ Fresh experiment log for the reduced MQAR/GDH lab harness after the recent probe
 
 ## Experiment entries
 
+### 2026-03-30 — Entry 07 (remove capacity-stress enforcement from hard launchers)
+- Date/time: 2026-03-30
+- Hypothesis:
+  - Capacity-stress enforcement is not a launcher responsibility.
+  - Hard launchers should remain usable under slot-count overrides without forcing direct harness invocation.
+- Change:
+  1. Removed hard-coded `--enforce-capacity-stress` from:
+     - `experiments/run_probe_hard_mps.sh`
+     - `experiments/archive/gpu-lab/run_probe_hard.sh`
+- Notes:
+  - Capacity stress can still be requested explicitly via a direct override when desired.
+  - This restores the intended launcher workflow for hard-probe ablations such as `--gdh-slots 16`.
+
+### 2026-03-30 — Entry 06 (promote normalized state mixer to active launcher default)
+- Date/time: 2026-03-30
+- Hypothesis:
+  - Raw accumulated write state still looks more collapse-prone than the routing-mass normalized variant in the current active probe line.
+  - The normalized mixer is strong enough to become the default active MPS launcher setting while sum remains available as an explicit override.
+- Change:
+  1. Updated canonical active MPS launchers to pass:
+     - `--state-mixer normalized`
+  2. Files changed:
+     - `experiments/run_probe_easy_mps.sh`
+     - `experiments/run_probe_hard_mps.sh`
+  3. This only changes launcher defaults.
+     - The lab argparse still accepts both:
+       - `--state-mixer sum`
+       - `--state-mixer normalized`
+     - Passing `--state-mixer sum` after the launcher still overrides the default.
+- Notes:
+  - Dense routing remains the active launcher default unless explicitly overridden.
+  - This keeps the active probe surface aligned with current experiments without removing the sum ablation.
+
+### 2026-03-30 — Entry 05 (normalized state-mixer ablation scaffold)
+- Date/time: 2026-03-30
+- Hypothesis:
+  - Raw cumulative-sum sidecar accumulation may be amplifying collapse simply because heavily written slots accumulate unbounded magnitude.
+  - A routing-mass normalized running-average mixer should test whether accumulation itself is the problem while preserving the token-parallel scan structure.
+- Change:
+  1. Added new probe flag:
+     - `--state-mixer {sum,normalized}`
+  2. `sum` keeps the current behavior:
+     - sidecar update uses accumulated write deltas directly
+  3. `normalized` now computes, per layer:
+     - numerator = tokenwise scan of write deltas
+     - denominator = tokenwise scan of per-slot routing mass
+     - layer contribution = numerator / clamp(denominator, eps)
+  4. Run labels now include:
+     - `__mix=...`
+  5. Dashboard compact config now shows:
+     - `state_mixer`
+- Notes:
+  - This is intentionally a strong diagnostic ablation.
+  - It changes the semantics of sidecar state from raw accumulated write content toward routing-mass normalized running averages.
+  - The current implementation keeps the existing layerwise additive structure and the same scan primitive family.
+- Next:
+  - Run easy MQAR with `state_mixer=normalized` first.
+  - Compare slot cosine collapse, participation ratio, and MRR against the dense default `sum` mixer.
+
+### 2026-03-30 — Entry 04 (promote dense routing to active default)
+- Date/time: 2026-03-30
+- Hypothesis:
+  - Hard top-k masking may be creating unnecessary dead-slot behavior, especially in early layers.
+  - Dense static routing is a better active default until stronger evidence favors sparse routing again.
+- Change:
+  1. Updated canonical active MPS launchers to use dense routing by default:
+     - `experiments/run_probe_easy_mps.sh`
+     - `experiments/run_probe_hard_mps.sh`
+  2. Default launcher arg changed from:
+     - `--route-topk 4`
+     - to
+     - `--route-topk 0`
+  3. Recent-write cooloff remains an explicit ablation knob on top of the new dense default.
+- Notes:
+  - This only changes the launcher defaults, not the lab argparse default.
+  - Dense routing should be treated as the current active probe default pending comparison follow-through on easy and hard runs.
+- Next:
+  - Run easy dense-routing + cooloff as the next active reference run.
+  - Compare layer-0 dead-slot behavior and collapse telemetry against the older sparse default.
+
+### 2026-03-29 — Entry 03 (recent-write cooloff ablation scaffold)
+- Date/time: 2026-03-29
+- Hypothesis:
+  - Current collapse may come less from narrow routing and more from repeatedly writing into recently hot slots.
+  - A local, mechanism-level cooloff based on recent routing mass may reduce runaway slot reuse without adding an explicit geometry loss.
+- Change:
+  1. Added write cooloff knobs:
+     - `--write-cooloff-lambda`
+     - `--write-cooloff-rho`
+  2. `_write_delta(...)` now returns both:
+     - `delta`
+     - final routing weights `alpha`
+  3. In `_write_delta(...)`, when `write_cooloff_lambda > 0`:
+     - compute a first-pass routing distribution
+     - compute recent slot write-mass as head-summed routing mass per token/slot
+     - run a leaky tokenwise scan over that recent usage with decay `write_cooloff_rho`
+     - shift by one token to get prior recent usage only
+     - subtract recent usage from routing logits before final slot selection
+  4. Run labels now include:
+     - `__wc=<lambda>@<rho>`
+  5. Dashboard compact config now shows:
+     - `write_cooloff_lambda`
+     - `write_cooloff_rho`
+- Notes:
+  - This intervention is probe-local and keeps the existing parallel tokenwise structure.
+  - It is intended as a more organic alternative to slot-geometry regularization losses.
+  - It targets recent slot overuse, not total accumulated slot norm.
+- Next:
+  - Compare easy MQAR with `topk=4` and recent-write cooloff on/off.
+  - Watch slot cosine max/p90, participation ratio, and MRR together.
+
 ### 2026-03-29 — Entry 02 (ClimbMix hook for probe-side collapse audits)
 - Date/time: 2026-03-29
 - Hypothesis:

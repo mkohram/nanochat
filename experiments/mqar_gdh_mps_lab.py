@@ -394,6 +394,17 @@ def _apply_write_brain_local(write_core, delta: torch.Tensor, *, eps: float) -> 
     return delta + torch.matmul(hidden, write_core.W_write_mlp_out_global)
 
 
+def _apply_route_topk(alpha: torch.Tensor, route_topk: int) -> torch.Tensor:
+    r = alpha.shape[-1]
+    if route_topk > 0 and route_topk < r:
+        top_idx = torch.topk(alpha, k=route_topk, dim=-1).indices
+        mask = torch.zeros_like(alpha)
+        mask.scatter_(-1, top_idx, 1.0)
+        alpha = alpha * mask
+        alpha = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    return alpha
+
+
 def _write_delta(
     write_core,
     local_out: torch.Tensor,
@@ -402,6 +413,8 @@ def _write_delta(
     n_write_heads: int,
     route_topk: int,
     routing_mode: str,
+    write_cooloff_lambda: float,
+    write_cooloff_rho: float,
     eps: float,
 ) -> torch.Tensor:
     """Reduced GDH write path used by this lab harness.
@@ -447,20 +460,23 @@ def _write_delta(
         raise ValueError(f"unknown routing_mode: {routing_mode}")
 
     alpha = torch.softmax(logits, dim=-1)
+    alpha = _apply_route_topk(alpha, route_topk)
 
-    if route_topk > 0 and route_topk < r:
-        top_idx = torch.topk(alpha, k=route_topk, dim=-1).indices
-        mask = torch.zeros_like(alpha)
-        mask.scatter_(-1, top_idx, 1.0)
-        alpha = alpha * mask
-        alpha = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    if write_cooloff_lambda > 0.0:
+        recent_mass = alpha.sum(dim=2, keepdim=False).unsqueeze(-1)
+        usage = _scan_accumulate(recent_mass, scan_beta=write_cooloff_rho)
+        usage_prev = torch.zeros_like(usage)
+        usage_prev[:, 1:] = usage[:, :-1]
+        cooled_logits = logits - write_cooloff_lambda * usage_prev.squeeze(-1).unsqueeze(2)
+        alpha = torch.softmax(cooled_logits, dim=-1)
+        alpha = _apply_route_topk(alpha, route_topk)
 
     delta_heads = torch.einsum("bnhr,bnhd->bnhrd", alpha, v_h)
     delta_raw = delta_heads.permute(0, 1, 3, 2, 4).contiguous().view(bsz, n_tokens, r, d)
     delta = torch.einsum("bnrd,df->bnrf", delta_raw, write_core.W_o_write)
     delta = _apply_write_brain_local(write_core, delta, eps=eps)
 
-    return delta
+    return delta, alpha
 
 
 def _make_run_label(args: argparse.Namespace, beta: float) -> str:
@@ -473,6 +489,8 @@ def _make_run_label(args: argparse.Namespace, beta: float) -> str:
         f"__wb={int(bool(args.gdh_use_write_brain))}"
         f"__ve={int(bool(args.value_embeds))}"
         f"__data={args.data_source}"
+        f"__mix={args.state_mixer}"
+        f"__wc={args.write_cooloff_lambda:g}@{args.write_cooloff_rho:g}"
         f"__slots={args.gdh_slots}"
         f"__pairs={args.n_pairs}"
         f"__queries={args.n_queries}"
@@ -670,6 +688,9 @@ def _forward_gdh(
     scan_beta: float,
     route_topk: int,
     write_routing: str,
+    state_mixer: str,
+    write_cooloff_lambda: float,
+    write_cooloff_rho: float,
     eval_topk: int,
     collect_sidecar: bool,
     compute_topk: bool,
@@ -705,17 +726,28 @@ def _forward_gdh(
         ve = model.value_embeds[str(i)](idx) if str(i) in model.value_embeds else None
         x = block(x, ve, cos_sin, model.window_sizes[i], kv_cache=None)
 
-        delta = _write_delta(
+        delta, alpha = _write_delta(
             model.gdh_write[i],
             x,
             sidecar,
             n_write_heads=gdh_heads,
             route_topk=route_topk,
             routing_mode=write_routing,
+            write_cooloff_lambda=write_cooloff_lambda,
+            write_cooloff_rho=write_cooloff_rho,
             eps=1e-6,
         )
 
-        sidecar = sidecar + _scan_accumulate(delta, scan_beta=scan_beta)
+        recent_mass = alpha.sum(dim=2, keepdim=False).unsqueeze(-1)
+
+        if state_mixer == "sum":
+            sidecar = sidecar + _scan_accumulate(delta, scan_beta=scan_beta)
+        elif state_mixer == "normalized":
+            numer = _scan_accumulate(delta, scan_beta=scan_beta)
+            denom = _scan_accumulate(recent_mass, scan_beta=scan_beta).clamp_min(1e-6)
+            sidecar = sidecar + numer / denom
+        else:
+            raise ValueError(f"unknown state_mixer: {state_mixer}")
 
         if collect_sidecar:
             slot_stats = _slot_stats_last(sidecar)
@@ -837,6 +869,9 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                         scan_beta=beta,
                         route_topk=args.route_topk,
                         write_routing=args.write_routing,
+                        state_mixer=args.state_mixer,
+                        write_cooloff_lambda=args.write_cooloff_lambda,
+                        write_cooloff_rho=args.write_cooloff_rho,
                         eval_topk=args.eval_topk,
                         collect_sidecar=True,
                         compute_topk=full_metrics,
@@ -966,6 +1001,9 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                     scan_beta=beta,
                     route_topk=args.route_topk,
                     write_routing=args.write_routing,
+                    state_mixer=args.state_mixer,
+                    write_cooloff_lambda=args.write_cooloff_lambda,
+                    write_cooloff_rho=args.write_cooloff_rho,
                     eval_topk=args.eval_topk,
                     collect_sidecar=False,
                     compute_topk=False,
@@ -1088,6 +1126,9 @@ def main() -> None:
     p.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4)
     p.add_argument("--route-topk", type=int, default=0)
     p.add_argument("--write-routing", type=str, default="static", choices=["static", "content", "hybrid"], help="write routing source: learned slot addresses, current sidecar contents, or both")
+    p.add_argument("--state-mixer", type=str, default="sum", choices=["sum", "normalized"], help="tokenwise sidecar accumulation rule: raw cumulative sum or routing-mass normalized running average")
+    p.add_argument("--write-cooloff-lambda", type=float, default=0.0, help="recent-write cooloff strength; subtracts recent slot usage from routing logits before slot selection")
+    p.add_argument("--write-cooloff-rho", type=float, default=0.9, help="decay for recent-write usage trace used by write cooloff")
     p.add_argument(
         "--read-mute-gate",
         action=argparse.BooleanOptionalAction,
@@ -1155,6 +1196,11 @@ def main() -> None:
             raise ValueError("capacity stress requested but n_pairs <= gdh_slots")
         if args.swa_window > 0 and args.gap_min <= args.swa_window:
             raise ValueError(f"gap_min ({args.gap_min}) must be > swa_window ({args.swa_window}) to ensure blindfold")
+
+    if not (0.0 <= args.write_cooloff_rho <= 1.0):
+        raise ValueError("write_cooloff_rho must be in [0, 1]")
+    if args.write_cooloff_lambda < 0.0:
+        raise ValueError("write_cooloff_lambda must be >= 0")
 
     if args.arch == "baseline" and args.route_topk != 0:
         print("[warn] route_topk ignored for baseline arch", flush=True)
