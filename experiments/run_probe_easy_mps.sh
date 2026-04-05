@@ -56,7 +56,7 @@ exec "$PY" experiments/mqar_gdh_mps_lab.py \
   --gdh-slots 8 \
   --gdh-write-heads 1 \
   --route-topk 0 \
-  --write-routing static \
+  --write-routing seeded \
   --swa-window 8 \
   --n-pairs 2 \
   --n-queries 2 \

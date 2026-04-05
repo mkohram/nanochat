@@ -432,6 +432,7 @@ def _write_delta(
     local_out: torch.Tensor,
     sidecar_prev: torch.Tensor,
     *,
+    layer_idx: int,
     n_write_heads: int,
     route_topk: int,
     routing_mode: str,
@@ -444,6 +445,7 @@ def _write_delta(
     Routing ablations:
       - static: learned slot addresses only
       - content: current sidecar contents only
+      - seeded: layer 0 uses learned slot seed state; later layers use previous-layer sidecar state only
       - hybrid: static + content logits
 
     Returns:
@@ -471,8 +473,15 @@ def _write_delta(
         logits_static = torch.einsum("rhd,bnhd->bnhr", q_static_h, k_h) / math.sqrt(d_h)
         logits = logits_static if logits is None else logits + logits_static
 
-    if routing_mode in {"content", "hybrid"}:
-        s_slots = _rms_norm(sidecar_prev, eps=eps)
+    if routing_mode in {"content", "hybrid", "seeded"}:
+        if routing_mode == "seeded":
+            if layer_idx == 0:
+                routing_state = write_core.E_slots.view(1, 1, r, d).expand(bsz, n_tokens, r, d)
+            else:
+                routing_state = sidecar_prev
+        else:
+            routing_state = sidecar_prev
+        s_slots = _rms_norm(routing_state, eps=eps)
         q_slots_content = torch.einsum("bnrd,df->bnrf", s_slots, write_core.W_q_slots_global)
         q_content_h = q_slots_content.view(bsz, n_tokens, r, n_write_heads, d_h)
         logits_content = torch.einsum("bnrhd,bnhd->bnhr", q_content_h, k_h) / math.sqrt(d_h)
@@ -807,6 +816,7 @@ def _forward_gdh(
             model.gdh_write[i],
             x,
             sidecar,
+            layer_idx=i,
             n_write_heads=gdh_heads,
             route_topk=route_topk,
             routing_mode=write_routing,
@@ -1267,7 +1277,7 @@ def main() -> None:
     )
     p.add_argument("--gdh-write-brain-hidden-mult", type=int, default=4)
     p.add_argument("--route-topk", type=int, default=0)
-    p.add_argument("--write-routing", type=str, default="static", choices=["static", "content", "hybrid"], help="write routing source: learned slot addresses, current sidecar contents, or both")
+    p.add_argument("--write-routing", type=str, default="static", choices=["static", "content", "seeded", "hybrid"], help="write routing source: learned slot addresses, current sidecar contents, learned slot seed state at layer 0 then previous-layer sidecar thereafter, or static+content hybrid")
     p.add_argument("--state-mixer", type=str, default="sum", choices=["sum", "normalized"], help="tokenwise sidecar accumulation rule: raw cumulative sum or routing-mass normalized running average")
     p.add_argument("--write-cooloff-lambda", type=float, default=0.0, help="recent-write cooloff strength; subtracts recent slot usage from routing logits before slot selection")
     p.add_argument("--write-cooloff-rho", type=float, default=0.9, help="decay for recent-write usage trace used by write cooloff")

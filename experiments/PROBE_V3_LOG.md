@@ -25,6 +25,47 @@ Fresh experiment log for the reduced MQAR/GDH lab harness after the recent probe
 
 ## Experiment entries
 
+### 2026-04-05 — Entry 11 (promote seeded write routing to active launcher default)
+- Date/time: 2026-04-05
+- Hypothesis:
+  - The one-state bootstrap direction is now the active write-routing experiment line.
+  - Canonical easy/hard launchers should default to `seeded` rather than permanent static routing.
+- Change:
+  1. Updated active MPS launchers to pass:
+     - `--write-routing seeded`
+  2. Files changed:
+     - `experiments/run_probe_easy_mps.sh`
+     - `experiments/run_probe_hard_mps.sh`
+- Notes:
+  - This changes launcher defaults only.
+  - Lab argparse still supports:
+     - `static`
+     - `content`
+     - `seeded`
+     - `hybrid`
+  - `seeded` means:
+     - layer 0 routes from learned slot seed state
+     - later layers route from previous-layer sidecar state only
+
+### 2026-04-05 — Entry 10 (seeded write-routing mode for one-state bootstrap)
+- Date/time: 2026-04-05
+- Hypothesis:
+  - Pure content-based write routing collapses because the slot state starts identically at zero.
+  - A cleaner simplification than permanent static slot routing is to route from an evolving slot state that is bootstrapped from learned slot seeds only at layer 0.
+- Change:
+  1. Added new write-routing mode:
+     - `--write-routing seeded`
+  2. `seeded` now means:
+     - layer 0 routing state = learned slot seed state `E_slots`
+     - later-layer routing state = previous-layer sidecar state only
+  3. Interpretation:
+     - `E_slots` act as learned slot seed state for bootstrap, not as a permanent additive routing bias.
+  4. Read path is intentionally unchanged for now so this isolates write-side behavior.
+- Notes:
+  - This keeps token-parallel training intact.
+  - At layer 0, all tokens see the same learned slot seed table, but slots remain asymmetric because seed vectors differ by slot.
+  - This is a write-side step toward a one-state `S` formulation without yet changing read semantics.
+
 ### 2026-03-31 — Entry 09 (minimal grad-accum knob for larger effective batches)
 - Date/time: 2026-03-31
 - Hypothesis:
