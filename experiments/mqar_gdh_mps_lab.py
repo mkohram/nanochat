@@ -494,7 +494,7 @@ def _write_delta(
     alpha = _apply_route_topk(alpha, route_topk)
 
     if write_cooloff_lambda > 0.0:
-        recent_mass = alpha.sum(dim=2, keepdim=False).unsqueeze(-1)
+        recent_mass = alpha.mean(dim=2, keepdim=False).unsqueeze(-1)
         usage = _scan_accumulate(recent_mass, scan_beta=write_cooloff_rho)
         usage_prev = torch.zeros_like(usage)
         usage_prev[:, 1:] = usage[:, :-1]
@@ -825,7 +825,7 @@ def _forward_gdh(
             eps=1e-6,
         )
 
-        recent_mass = alpha.sum(dim=2, keepdim=False).unsqueeze(-1)
+        recent_mass = alpha.mean(dim=2, keepdim=False).unsqueeze(-1)
 
         if state_mixer == "sum":
             sidecar = sidecar + _scan_accumulate(delta, scan_beta=scan_beta)

@@ -25,6 +25,41 @@ Fresh experiment log for the reduced MQAR/GDH lab harness after the recent probe
 
 ## Experiment entries
 
+### 2026-04-05 — Entry 13 (add dedicated hard ClimbMix MPS launcher)
+- Date/time: 2026-04-05
+- Hypothesis:
+  - Hard ClimbMix has become a recurring stability / realism check and deserves a dedicated launcher rather than ad hoc override strings.
+- Change:
+  1. Added:
+     - `experiments/run_probe_hard_climbmix_mps.sh`
+  2. The wrapper delegates to the active hard MPS launcher and applies ClimbMix-specific overrides:
+     - `--data-source climbmix`
+     - `--gdh-slots 32`
+     - `--gdh-write-heads 16`
+     - `--swa-window 0`
+     - `--future-summary-horizon 0`
+     - `--future-summary-lambda 0.0`
+     - `--eval-batch-size 2`
+     - `--log-every 5`
+- Notes:
+  - This intentionally inherits the current active hard-launcher defaults for the rest of the probe surface.
+  - Extra flags passed to the wrapper still override these defaults.
+
+### 2026-04-05 — Entry 12 (make normalized write mass head-invariant)
+- Date/time: 2026-04-05
+- Hypothesis:
+  - The normalized state mixer should average write usage per token, not per write head.
+  - Head count should change write factorization, not the total routing-mass budget contributed by a token.
+- Change:
+  1. Changed routed mass used by normalized state mixing from:
+     - `sum_h alpha[t,h,r]`
+     - to
+     - `mean_h alpha[t,h,r]`
+  2. Applied the same head-invariant routed mass convention to the write-cooloff usage trace.
+- Notes:
+  - With `gdh_write_heads=1`, this is a no-op.
+  - With `gdh_write_heads>1`, each token now contributes total routed mass `1` rather than `H`.
+
 ### 2026-04-05 — Entry 11 (promote seeded write routing to active launcher default)
 - Date/time: 2026-04-05
 - Hypothesis:
