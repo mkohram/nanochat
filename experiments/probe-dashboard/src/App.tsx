@@ -32,8 +32,10 @@ function compactConfig(cfg?: Record<string, unknown>): string {
     'arch','data_source','betas','steps','log_every','seed','sequence_len','vocab_size',
     'n_layer','n_head','n_embd','gdh_slots','gdh_write_heads',
     'gdh_use_write_brain','gdh_write_brain_hidden_mult','read_mute_gate',
-    'route_topk','write_routing','state_mixer','write_cooloff_lambda','write_cooloff_rho','swa_window','n_pairs','n_queries',
-    'gap_min','gap_max','batch_size','eval_batch_size','lr','lr_decay_iters','min_lr','device',
+    'route_topk','write_routing','state_mixer','write_cooloff_lambda','write_cooloff_rho',
+    'future_summary_horizon','future_summary_lambda','future_summary_hidden_mult',
+    'swa_window','n_pairs','n_queries',
+    'gap_min','gap_max','batch_size','grad_accum_steps','eval_batch_size','lr','lr_decay_iters','min_lr','device',
   ]
   return keys.filter((k) => cfg[k] !== undefined).map((k) => `${k}=${String(cfg[k])}`).join(' | ')
 }
@@ -75,10 +77,6 @@ function carryForward(values: Array<number | null | undefined>): Array<number | 
     }
     return last
   })
-}
-
-function vocabRandomCE(vocabSize: unknown): number | null {
-  return typeof vocabSize === 'number' && Number.isFinite(vocabSize) && vocabSize > 0 ? Math.log(vocabSize) : null
 }
 
 function vocabRandomTop1(vocabSize: unknown): number | null {
@@ -335,13 +333,21 @@ export function App() {
   const learningData = history.map((row, i) => {
     const evalCe = typeof row.eval_ce === 'number' ? row.eval_ce : null
     const trainCe = typeof row.train_ce === 'number' ? row.train_ce : null
+    const evalTotal = typeof row.eval_total === 'number' ? row.eval_total : null
+    const trainTotal = typeof row.train_total === 'number' ? row.train_total : null
+    const evalFutureSummaryLoss = typeof row.eval_future_summary_loss === 'number' ? row.eval_future_summary_loss : null
+    const trainFutureSummaryLoss = typeof row.train_future_summary_loss === 'number' ? row.train_future_summary_loss : null
     return {
       step: row.step,
       wall_time_min: typeof row.wall_time_min === 'number' ? row.wall_time_min : null,
       eval_acc_top1: typeof row.eval_acc_top1 === 'number' ? row.eval_acc_top1 : null,
       eval_mrr: shownEvalMrr[i],
+      eval_total: evalTotal,
+      train_total: trainTotal,
       eval_ce: evalCe,
       train_ce: trainCe,
+      eval_future_summary_loss: evalFutureSummaryLoss,
+      train_future_summary_loss: trainFutureSummaryLoss,
       eval_ppl: ceToPpl(evalCe),
       train_ppl: ceToPpl(trainCe),
       full_metrics: Boolean(row.full_metrics),
@@ -350,8 +356,16 @@ export function App() {
   const randomTop1 = vocabRandomTop1(payload?.config?.vocab_size)
   const randomMrr = vocabRandomMRR(payload?.config?.vocab_size)
   const domainData = learningData.slice(Math.max(0, Math.min(yAxisIgnoreFirst, Math.max(0, learningData.length - 1))))
+  const totalLossDomain = paddedDomain(
+    domainData.flatMap((row) => [row.eval_total, row.train_total]),
+    0.06,
+  )
   const ceDomain = paddedDomain(
     domainData.flatMap((row) => [row.eval_ce, row.train_ce]),
+    0.06,
+  )
+  const futureSummaryDomain = paddedDomain(
+    domainData.flatMap((row) => [row.eval_future_summary_loss, row.train_future_summary_loss]),
     0.06,
   )
   const pplDomain = paddedPositiveDomain(
@@ -399,7 +413,9 @@ export function App() {
         <StatCard title="Step" value={last ? String(last.step) : '—'} subtitle={payload?.beta !== undefined ? `beta=${payload.beta}` : undefined} />
         <StatCard title="Wall time" value={fmt(last?.wall_time_min, 2)} subtitle="minutes" />
         <StatCard title="Eval top1" value={fmt(last?.eval_acc_top1)} subtitle={`MRR ${fmt(last?.eval_mrr)}`} />
+        <StatCard title="Eval total" value={fmt(last?.eval_total)} subtitle={`Train total ${fmt(last?.train_total)}`} />
         <StatCard title="Eval CE" value={fmt(last?.eval_ce)} subtitle={`Train CE ${fmt(last?.train_ce)}`} />
+        <StatCard title="Eval future loss" value={fmt(last?.eval_future_summary_loss)} subtitle={`Train future loss ${fmt(last?.train_future_summary_loss)}`} />
         <StatCard title="Eval PPL" value={fmt(ceToPpl(last?.eval_ce), 2)} subtitle={`Train PPL ${fmt(ceToPpl(last?.train_ce), 2)}`} />
         <StatCard title="Slot cosine" value={fmt(last?.slot_cos_l_last)} subtitle="last layer" />
         <StatCard title="Out abs max" value={fmt(last?.out_state_stats?.abs_max)} subtitle={`std ${fmt(last?.out_state_stats?.std)}`} />
@@ -414,7 +430,7 @@ export function App() {
         <div className="axis-control-card">
           <div className="axis-control-copy">
             <div className="axis-control-title">Y-axis autoscale</div>
-            <div className="axis-control-subtitle">Ignore the first N points for CE / perplexity domain selection.</div>
+            <div className="axis-control-subtitle">Ignore the first N points for total / CE / future-summary / perplexity domain selection.</div>
           </div>
           <div className="axis-control-actions">
             <div className="axis-control-presets">
@@ -496,6 +512,22 @@ export function App() {
           </div>
         </Panel>
 
+        <Panel title="Train vs eval total loss">
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <LineChart data={learningData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="step" />
+                <YAxis domain={totalLossDomain ?? ['auto', 'auto']} tickFormatter={(v) => fmt(v, 2)} width={54} allowDataOverflow />
+                <Tooltip formatter={(value: unknown) => fmt(value, 3)} />
+                <Legend />
+                <Line type="monotone" dataKey="eval_total" name="eval_total" stroke="#be123c" dot={false} strokeWidth={2} connectNulls />
+                <Line type="monotone" dataKey="train_total" name="train_total" stroke="#0f766e" dot={false} strokeWidth={2} connectNulls />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
+
         <Panel title="Train vs eval CE">
           <div className="chart-wrap">
             <ResponsiveContainer>
@@ -505,8 +537,24 @@ export function App() {
                 <YAxis domain={ceDomain ?? ['auto', 'auto']} tickFormatter={(v) => fmt(v, 2)} width={54} allowDataOverflow />
                 <Tooltip formatter={(value: unknown) => fmt(value, 3)} />
                 <Legend />
-                <Line type="monotone" dataKey="eval_ce" name="eval_ce" stroke="#dc2626" dot={false} strokeWidth={2} />
-                <Line type="monotone" dataKey="train_ce" name="train_ce" stroke="#0ea5e9" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="eval_ce" name="eval_ce" stroke="#dc2626" dot={false} strokeWidth={2} connectNulls />
+                <Line type="monotone" dataKey="train_ce" name="train_ce" stroke="#0ea5e9" dot={false} strokeWidth={2} connectNulls />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
+
+        <Panel title="Train vs eval future-summary loss">
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <LineChart data={learningData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="step" />
+                <YAxis domain={futureSummaryDomain ?? ['auto', 'auto']} tickFormatter={(v) => fmt(v, 2)} width={54} allowDataOverflow />
+                <Tooltip formatter={(value: unknown) => fmt(value, 3)} />
+                <Legend />
+                <Line type="monotone" dataKey="eval_future_summary_loss" name="eval_future_summary_loss" stroke="#7c3aed" dot={false} strokeWidth={2} connectNulls />
+                <Line type="monotone" dataKey="train_future_summary_loss" name="train_future_summary_loss" stroke="#22c55e" dot={false} strokeWidth={2} connectNulls />
               </LineChart>
             </ResponsiveContainer>
           </div>

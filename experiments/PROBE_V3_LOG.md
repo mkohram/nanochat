@@ -25,6 +25,57 @@ Fresh experiment log for the reduced MQAR/GDH lab harness after the recent probe
 
 ## Experiment entries
 
+### 2026-03-31 — Entry 09 (minimal grad-accum knob for larger effective batches)
+- Date/time: 2026-03-31
+- Hypothesis:
+  - On this MPS machine, larger effective batches should come from simple gradient accumulation rather than pushing microbatch size to the OOM cliff.
+  - The probe can support this with minimal intrusion by accumulating multiple standard micro-steps before each optimizer step.
+- Change:
+  1. Added new flag:
+     - `--grad-accum-steps`
+  2. Training loop now:
+     - runs `grad_accum_steps` micro-batches per optimizer step
+     - divides each micro-step loss by `grad_accum_steps` before backward
+     - calls `opt.step()` once after the accumulation loop
+  3. Train-side logged scalars are now the mean across micro-steps for that optimizer step.
+  4. Run labels now include:
+     - `__ga=...`
+  5. Startup logging now prints:
+     - microbatch size
+     - grad accumulation steps
+     - effective batch size
+     - effective tokens per optimizer step
+- Notes:
+  - This keeps eval behavior unchanged.
+  - It is intentionally simpler than mainline distributed batch handling: no DDP-aware token math, just local micro-step accumulation.
+
+### 2026-03-30 — Entry 08 (future-summary auxiliary head scaffold)
+- Date/time: 2026-03-30
+- Hypothesis:
+  - The final sidecar state may benefit from a direct pressure to encode short-horizon future context rather than only supporting the answer-token CE path.
+  - A small MLP trained to predict a summary of the next `N` tokens could encourage the state to think ahead.
+- Change:
+  1. Added a probe-local future-summary auxiliary head on the final sidecar state.
+  2. The head uses slot-mean pooled final sidecar state at each token position.
+  3. The target is the mean token embedding of the next `N` tokens.
+  4. The auxiliary loss is cosine distance between predicted and target future summaries.
+  5. Added new flags:
+     - `--future-summary-horizon`
+     - `--future-summary-lambda`
+     - `--future-summary-hidden-mult`
+  6. Run labels now include:
+     - `__fs=<lambda>x<horizon>`
+  7. Logged eval/train auxiliary scalars:
+     - `eval_future_summary_loss`
+     - `train_future_summary_loss`
+- Notes:
+  - This is currently implemented only for `arch=gdh`.
+  - Setting either horizon or lambda alone is treated as invalid; both must be enabled together.
+  - The target summary is detached from the current embedding table during loss computation.
+- Validation:
+  - `python3 -m py_compile experiments/mqar_gdh_mps_lab.py`
+  - 2-step MQAR smoke test with `--future-summary-horizon 4 --future-summary-lambda 0.1` passed.
+
 ### 2026-03-30 — Entry 07 (remove capacity-stress enforcement from hard launchers)
 - Date/time: 2026-03-30
 - Hypothesis:

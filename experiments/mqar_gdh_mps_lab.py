@@ -148,6 +148,28 @@ class LabGDHWriteCore(nn.Module):
             nn.init.zeros_(self.W_write_mlp_out_global)
 
 
+class LabFutureSummaryHead(nn.Module):
+    """Probe-local MLP that predicts a short-horizon future summary from sidecar state."""
+
+    def __init__(self, d: int, *, hidden_mult: int = 4):
+        super().__init__()
+        if hidden_mult <= 0:
+            raise ValueError("LabFutureSummaryHead requires positive hidden_mult")
+        hidden = hidden_mult * d
+        self.W_in = nn.Parameter(torch.empty(d, hidden))
+        self.W_out = nn.Parameter(torch.empty(hidden, d))
+
+    def reset_parameters(self, *, std: float) -> None:
+        s = math.sqrt(3.0) * std
+        nn.init.uniform_(self.W_in, -0.4 * s, 0.4 * s)
+        nn.init.uniform_(self.W_out, -0.4 * s, 0.4 * s)
+
+    def forward(self, x: torch.Tensor, *, eps: float) -> torch.Tensor:
+        x = _rms_norm(x, eps=eps)
+        hidden = torch.relu(torch.matmul(x, self.W_in)).square()
+        return torch.matmul(hidden, self.W_out)
+
+
 def _tie_gdh_global_weights_local(read_cores: nn.ModuleList, write_cores: nn.ModuleList) -> None:
     if len(read_cores) <= 1:
         return
@@ -479,6 +501,40 @@ def _write_delta(
     return delta, alpha
 
 
+def _future_summary_loss(
+    model: GPT,
+    sidecar: torch.Tensor,
+    next_tokens_full: torch.Tensor,
+    *,
+    horizon: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if horizon <= 0:
+        zero = sidecar.new_zeros(())
+        return zero, zero
+
+    _, n_tokens, _, _ = sidecar.shape
+    if horizon > n_tokens:
+        raise ValueError("future_summary_horizon must be <= sequence length")
+
+    state_last = sidecar.mean(dim=2)
+    pred = model.gdh_future_summary(state_last[:, : n_tokens - horizon + 1], eps=eps).float()
+
+    with torch.no_grad():
+        future_embeds = model.transformer.wte(next_tokens_full).float()
+        prefix = torch.cat([
+            future_embeds.new_zeros(future_embeds.shape[0], 1, future_embeds.shape[-1]),
+            future_embeds.cumsum(dim=1),
+        ], dim=1)
+        future_sum = prefix[:, horizon:] - prefix[:, :-horizon]
+        target = future_sum / float(horizon)
+
+    pred_unit = F.normalize(pred, dim=-1, eps=eps)
+    target_unit = F.normalize(target, dim=-1, eps=eps)
+    loss = (1.0 - (pred_unit * target_unit).sum(dim=-1)).mean()
+    return loss, pred.norm(dim=-1).mean()
+
+
 def _make_run_label(args: argparse.Namespace, beta: float) -> str:
     return (
         f"arch={args.arch}"
@@ -491,6 +547,8 @@ def _make_run_label(args: argparse.Namespace, beta: float) -> str:
         f"__data={args.data_source}"
         f"__mix={args.state_mixer}"
         f"__wc={args.write_cooloff_lambda:g}@{args.write_cooloff_rho:g}"
+        f"__fs={args.future_summary_lambda:g}x{args.future_summary_horizon}"
+        f"__ga={args.grad_accum_steps}"
         f"__slots={args.gdh_slots}"
         f"__pairs={args.n_pairs}"
         f"__queries={args.n_queries}"
@@ -554,16 +612,22 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
             )
             for _ in range(model.config.n_layer)
         ]).to(device)
+        model.gdh_future_summary = LabFutureSummaryHead(
+            model.config.n_embd,
+            hidden_mult=args.future_summary_hidden_mult,
+        ).to(device)
         _tie_gdh_global_weights_local(model.gdh_read, model.gdh_write)
 
         gdh_std = model.config.n_embd ** -0.5
         for read_core, write_core in zip(model.gdh_read, model.gdh_write):
             read_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
             write_core.reset_parameters(std=gdh_std, zero_init_mixer=False)
+        model.gdh_future_summary.reset_parameters(std=gdh_std)
 
         if model.transformer.wte.weight.device.type == "cuda":
             model.gdh_read.to(dtype=torch.bfloat16)
             model.gdh_write.to(dtype=torch.bfloat16)
+            model.gdh_future_summary.to(dtype=torch.bfloat16)
 
         with torch.no_grad():
             for read_core in model.gdh_read:
@@ -571,6 +635,7 @@ def _build_model(args: argparse.Namespace, device: str) -> GPT:
     else:
         model.gdh_read = None
         model.gdh_write = None
+        model.gdh_future_summary = None
 
     return model
 
@@ -581,7 +646,10 @@ def make_mqar_batch(args: argparse.Namespace, batch_size: int, device: str):
     Full sequence pattern (length = sequence_len + 1):
       [K1 V1 K2 V2 ... KP VP] [filler gap] [Q1 A1 Q2 A2 ... QQ AQ] [tail filler]
 
-    Training objective is next-token prediction only at positions where current token is Q*.
+    Returns:
+      idx: current tokens [B,T]
+      targets: answer-only next-token targets with -100 elsewhere [B,T]
+      next_tokens_full: full next-token stream for auxiliary future-summary losses [B,T]
     """
 
     n_full = args.sequence_len + 1
@@ -648,7 +716,7 @@ def make_mqar_batch(args: argparse.Namespace, batch_size: int, device: str):
     is_query = (idx >= query_offset) & (idx < query_offset + key_vocab)
     targets[is_query] = nxt[is_query]
 
-    return idx, targets
+    return idx, targets, nxt
 
 
 def make_base_data_iter(args: argparse.Namespace, batch_size: int, device: str, split: str):
@@ -669,21 +737,28 @@ def _forward_baseline(
     model: GPT,
     idx: torch.Tensor,
     targets: torch.Tensor,
+    next_tokens_full: torch.Tensor | None,
     *,
     eval_topk: int,
     compute_topk: bool,
     compute_mrr: bool,
 ):
+    del next_tokens_full
     logits = model(idx)
     ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
     metrics = _compute_answer_metrics(logits, targets, eval_topk=eval_topk, compute_topk=compute_topk, compute_mrr=compute_mrr)
-    return ce_loss, ce_loss, metrics, None
+    aux = {
+        "future_summary_loss": 0.0,
+        "future_summary_pred_norm": 0.0,
+    }
+    return ce_loss, ce_loss, metrics, None, aux
 
 
 def _forward_gdh(
     model: GPT,
     idx: torch.Tensor,
     targets: torch.Tensor,
+    next_tokens_full: torch.Tensor,
     *,
     scan_beta: float,
     route_topk: int,
@@ -691,6 +766,8 @@ def _forward_gdh(
     state_mixer: str,
     write_cooloff_lambda: float,
     write_cooloff_rho: float,
+    future_summary_horizon: int,
+    future_summary_lambda: float,
     eval_topk: int,
     collect_sidecar: bool,
     compute_topk: bool,
@@ -769,7 +846,18 @@ def _forward_gdh(
     logits = softcap * torch.tanh(logits / softcap)
 
     ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
+    future_summary_loss = sidecar.new_zeros(())
+    future_summary_pred_norm = sidecar.new_zeros(())
     total_loss = ce_loss
+    if future_summary_lambda > 0.0:
+        future_summary_loss, future_summary_pred_norm = _future_summary_loss(
+            model,
+            sidecar,
+            next_tokens_full,
+            horizon=future_summary_horizon,
+            eps=1e-6,
+        )
+        total_loss = total_loss + future_summary_lambda * future_summary_loss
 
     metrics = _compute_answer_metrics(logits, targets, eval_topk=eval_topk, compute_topk=compute_topk, compute_mrr=compute_mrr)
     if collect_sidecar:
@@ -788,7 +876,11 @@ def _forward_gdh(
         }
     else:
         stats = None
-    return total_loss, ce_loss, metrics, stats
+    aux = {
+        "future_summary_loss": float(future_summary_loss.detach().float().cpu()),
+        "future_summary_pred_norm": float(future_summary_pred_norm.detach().float().cpu()),
+    }
+    return total_loss, ce_loss, metrics, stats, aux
 
 
 def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str, Any]:
@@ -822,17 +914,24 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         f"[{run_label}] lr_schedule base={base_lr:.6g} min={min_lr:.6g} decay_iters={lr_decay_iters}",
         flush=True,
     )
+    print(
+        f"[{run_label}] batch_size={args.batch_size} grad_accum_steps={args.grad_accum_steps} "
+        f"effective_batch={args.batch_size * args.grad_accum_steps} "
+        f"effective_tokens={args.batch_size * args.grad_accum_steps * args.sequence_len}",
+        flush=True,
+    )
 
     ac = _make_autocast(device, args.amp_dtype)
 
     torch.manual_seed(args.seed + 1)
     train_data_iter = None
     if args.data_source == "mqar":
-        eval_idx, eval_tgt = make_mqar_batch(args, batch_size=args.eval_batch_size, device=device)
+        eval_idx, eval_tgt, eval_next = make_mqar_batch(args, batch_size=args.eval_batch_size, device=device)
     else:
         train_data_iter = make_base_data_iter(args, batch_size=args.batch_size, device=device, split="train")
         eval_data_iter = make_base_data_iter(args, batch_size=args.eval_batch_size, device=device, split="val")
         eval_idx, eval_tgt = next(eval_data_iter)
+        eval_next = eval_tgt
 
     history: list[dict[str, Any]] = []
     run_start_time = time.perf_counter()
@@ -841,6 +940,8 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         step: int,
         train_total: float | None = None,
         train_ce: float | None = None,
+        train_future_summary_loss: float | None = None,
+        train_future_summary_pred_norm: float | None = None,
         train_acc1: float | None = None,
         train_mrr: float | None = None,
     ):
@@ -853,25 +954,29 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         with torch.no_grad():
             with ac:
                 if args.arch == "baseline":
-                    eval_total, eval_ce, eval_metrics, stats = _forward_baseline(
+                    eval_total, eval_ce, eval_metrics, stats, eval_aux = _forward_baseline(
                         model,
                         eval_idx,
                         eval_tgt,
+                        eval_next,
                         eval_topk=args.eval_topk,
                         compute_topk=full_metrics,
                         compute_mrr=full_metrics,
                     )
                 else:
-                    eval_total, eval_ce, eval_metrics, stats = _forward_gdh(
+                    eval_total, eval_ce, eval_metrics, stats, eval_aux = _forward_gdh(
                         model,
                         eval_idx,
                         eval_tgt,
+                        eval_next,
                         scan_beta=beta,
                         route_topk=args.route_topk,
                         write_routing=args.write_routing,
                         state_mixer=args.state_mixer,
                         write_cooloff_lambda=args.write_cooloff_lambda,
                         write_cooloff_rho=args.write_cooloff_rho,
+                        future_summary_horizon=args.future_summary_horizon,
+                        future_summary_lambda=args.future_summary_lambda,
                         eval_topk=args.eval_topk,
                         collect_sidecar=True,
                         compute_topk=full_metrics,
@@ -889,6 +994,8 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             "wall_time_min": float(wall_time_s / 60.0),
             "eval_total": float(eval_scalars[0]),
             "eval_ce": float(eval_scalars[1]),
+            "eval_future_summary_loss": float(eval_aux["future_summary_loss"]),
+            "eval_future_summary_pred_norm": float(eval_aux["future_summary_pred_norm"]),
             "eval_acc_top1": float(eval_metrics["acc_top1"]),
             "eval_mrr": None if eval_metrics["mrr"] is None else float(eval_metrics["mrr"]),
             "eval_n_answers": float(eval_metrics["n_answers"]),
@@ -935,6 +1042,10 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             rec["train_total"] = float(train_total)
         if train_ce is not None:
             rec["train_ce"] = float(train_ce)
+        if train_future_summary_loss is not None:
+            rec["train_future_summary_loss"] = float(train_future_summary_loss)
+        if train_future_summary_pred_norm is not None:
+            rec["train_future_summary_pred_norm"] = float(train_future_summary_pred_norm)
         if train_acc1 is not None:
             rec["train_acc_top1"] = float(train_acc1)
         if train_mrr is not None:
@@ -960,9 +1071,12 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
 
         cos_txt = "n/a" if rec["slot_cos_l_last"] is None else f"{rec['slot_cos_l_last']:.4f}"
         mrr_txt = "n/a" if rec["eval_mrr"] is None else f"{rec['eval_mrr']:.4f}"
+        fs_txt = ""
+        if args.future_summary_lambda > 0.0:
+            fs_txt = f" eval_fs={rec['eval_future_summary_loss']:.4f}"
         print(
             f"[{run_label}] step={step} eval_acc1={rec['eval_acc_top1']:.4f} "
-            f"eval_mrr={mrr_txt} eval_ce={rec['eval_ce']:.4f} "
+            f"eval_mrr={mrr_txt} eval_ce={rec['eval_ce']:.4f}{fs_txt} "
             f"slot_cos={cos_txt} lr={rec['lr']:.6g}",
             flush=True,
         )
@@ -977,48 +1091,76 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         for group in opt.param_groups:
             group["lr"] = lr_t
 
-        if args.data_source == "mqar":
-            idx, tgt = make_mqar_batch(args, batch_size=args.batch_size, device=device)
-        else:
-            idx, tgt = next(train_data_iter)
-
         opt.zero_grad(set_to_none=True)
-        with ac:
-            if args.arch == "baseline":
-                total, ce, train_metrics, _ = _forward_baseline(
-                    model,
-                    idx,
-                    tgt,
-                    eval_topk=args.eval_topk,
-                    compute_topk=False,
-                    compute_mrr=False,
-                )
+        train_total_sum = 0.0
+        train_ce_sum = 0.0
+        train_future_summary_loss_sum = 0.0
+        train_future_summary_pred_norm_sum = 0.0
+        train_acc1_sum = 0.0
+        train_mrr_sum = 0.0
+        train_mrr_count = 0
+
+        for _micro_step in range(args.grad_accum_steps):
+            if args.data_source == "mqar":
+                idx, tgt, next_full = make_mqar_batch(args, batch_size=args.batch_size, device=device)
             else:
-                total, ce, train_metrics, _ = _forward_gdh(
-                    model,
-                    idx,
-                    tgt,
-                    scan_beta=beta,
-                    route_topk=args.route_topk,
-                    write_routing=args.write_routing,
-                    state_mixer=args.state_mixer,
-                    write_cooloff_lambda=args.write_cooloff_lambda,
-                    write_cooloff_rho=args.write_cooloff_rho,
-                    eval_topk=args.eval_topk,
-                    collect_sidecar=False,
-                    compute_topk=False,
-                    compute_mrr=False,
-                )
-        total.backward()
+                idx, tgt = next(train_data_iter)
+                next_full = tgt
+
+            with ac:
+                if args.arch == "baseline":
+                    total, ce, train_metrics, _, train_aux = _forward_baseline(
+                        model,
+                        idx,
+                        tgt,
+                        next_full,
+                        eval_topk=args.eval_topk,
+                        compute_topk=False,
+                        compute_mrr=False,
+                    )
+                else:
+                    total, ce, train_metrics, _, train_aux = _forward_gdh(
+                        model,
+                        idx,
+                        tgt,
+                        next_full,
+                        scan_beta=beta,
+                        route_topk=args.route_topk,
+                        write_routing=args.write_routing,
+                        state_mixer=args.state_mixer,
+                        write_cooloff_lambda=args.write_cooloff_lambda,
+                        write_cooloff_rho=args.write_cooloff_rho,
+                        future_summary_horizon=args.future_summary_horizon,
+                        future_summary_lambda=args.future_summary_lambda,
+                        eval_topk=args.eval_topk,
+                        collect_sidecar=False,
+                        compute_topk=False,
+                        compute_mrr=False,
+                    )
+
+            (total / args.grad_accum_steps).backward()
+
+            train_total_sum += float(total.detach().item())
+            train_ce_sum += float(ce.detach().item())
+            train_future_summary_loss_sum += float(train_aux["future_summary_loss"])
+            train_future_summary_pred_norm_sum += float(train_aux["future_summary_pred_norm"])
+            train_acc1_sum += float(train_metrics["acc_top1"])
+            if train_metrics["mrr"] is not None:
+                train_mrr_sum += float(train_metrics["mrr"])
+                train_mrr_count += 1
+
         opt.step()
 
         if step % args.log_every == 0 or step == args.steps:
+            denom = float(args.grad_accum_steps)
             eval_record(
                 step=step,
-                train_total=float(total.item()),
-                train_ce=float(ce.item()),
-                train_acc1=float(train_metrics["acc_top1"]),
-                train_mrr=None if train_metrics["mrr"] is None else float(train_metrics["mrr"]),
+                train_total=train_total_sum / denom,
+                train_ce=train_ce_sum / denom,
+                train_future_summary_loss=train_future_summary_loss_sum / denom,
+                train_future_summary_pred_norm=train_future_summary_pred_norm_sum / denom,
+                train_acc1=train_acc1_sum / denom,
+                train_mrr=None if train_mrr_count == 0 else train_mrr_sum / float(train_mrr_count),
             )
 
     first = history[0]
@@ -1129,6 +1271,9 @@ def main() -> None:
     p.add_argument("--state-mixer", type=str, default="sum", choices=["sum", "normalized"], help="tokenwise sidecar accumulation rule: raw cumulative sum or routing-mass normalized running average")
     p.add_argument("--write-cooloff-lambda", type=float, default=0.0, help="recent-write cooloff strength; subtracts recent slot usage from routing logits before slot selection")
     p.add_argument("--write-cooloff-rho", type=float, default=0.9, help="decay for recent-write usage trace used by write cooloff")
+    p.add_argument("--future-summary-horizon", type=int, default=0, help="predict a summary of the next N tokens from the final sidecar state at each position; 0 disables")
+    p.add_argument("--future-summary-lambda", type=float, default=0.0, help="auxiliary loss weight for final-sidecar future-summary prediction")
+    p.add_argument("--future-summary-hidden-mult", type=int, default=4, help="hidden width multiplier for the future-summary MLP head")
     p.add_argument(
         "--read-mute-gate",
         action=argparse.BooleanOptionalAction,
@@ -1166,6 +1311,7 @@ def main() -> None:
     p.add_argument("--filler-vocab", type=int, default=2048)
 
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--grad-accum-steps", type=int, default=1, help="number of micro-steps to accumulate before each optimizer step")
     p.add_argument("--eval-batch-size", type=int, default=8)
     p.add_argument("--eval-topk", type=int, default=5)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -1201,9 +1347,23 @@ def main() -> None:
         raise ValueError("write_cooloff_rho must be in [0, 1]")
     if args.write_cooloff_lambda < 0.0:
         raise ValueError("write_cooloff_lambda must be >= 0")
+    if args.future_summary_horizon < 0:
+        raise ValueError("future_summary_horizon must be >= 0")
+    if args.future_summary_lambda < 0.0:
+        raise ValueError("future_summary_lambda must be >= 0")
+    if args.future_summary_hidden_mult <= 0:
+        raise ValueError("future_summary_hidden_mult must be > 0")
+    if args.future_summary_horizon > args.sequence_len:
+        raise ValueError("future_summary_horizon must be <= sequence_len")
+    if (args.future_summary_horizon == 0) != (args.future_summary_lambda == 0.0):
+        raise ValueError("future summary is enabled only when both future_summary_horizon > 0 and future_summary_lambda > 0")
+    if args.grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be > 0")
 
     if args.arch == "baseline" and args.route_topk != 0:
         print("[warn] route_topk ignored for baseline arch", flush=True)
+    if args.arch == "baseline" and args.future_summary_lambda > 0.0:
+        raise ValueError("future-summary auxiliary loss is only implemented for arch=gdh")
 
     betas = parse_betas(args.betas)
     if args.arch == "baseline":

@@ -13,12 +13,16 @@ export type ProbeHistoryPoint = {
   wall_time_min?: number
   eval_total?: number
   eval_ce?: number
+  eval_future_summary_loss?: number
+  eval_future_summary_pred_norm?: number
   eval_acc_top1?: number
   eval_mrr?: number
   eval_n_answers?: number
   eval_acc?: number
   train_total?: number
   train_ce?: number
+  train_future_summary_loss?: number
+  train_future_summary_pred_norm?: number
   train_acc_top1?: number
   train_mrr?: number
   slot_cos_l_last?: number | null
