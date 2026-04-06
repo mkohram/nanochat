@@ -25,6 +25,31 @@ Fresh experiment log for the reduced MQAR/GDH lab harness after the recent probe
 
 ## Experiment entries
 
+### 2026-04-05 — Entry 14 (add direct read/write load instrumentation and GDH-off usefulness eval)
+- Date/time: 2026-04-05
+- Hypothesis:
+  - Under the active normalized mixer, final sidecar norm-share is not a faithful proxy for routing load.
+  - The probe needs direct write/load concentration metrics and an explicit causal usefulness check before further architecture changes.
+- Change:
+  1. Added direct routing instrumentation from actual attention weights:
+     - write attention concentration from per-head `alpha`
+     - write load stats from head-invariant routed mass `mean_h alpha`
+     - read attention/load stats from read softmax weights
+  2. Kept existing sidecar geometry stats, but clarified them as state geometry rather than routing-load metrics.
+  3. Added eval-time GDH-off comparison pass:
+     - same eval batch
+     - same trunk
+     - GDH read/write disabled
+     - logs CE / top1 / MRR deltas versus normal eval
+  4. Updated dashboard to show:
+     - state-geometry charts under explicit state labels
+     - direct write/read routing-load charts
+     - GDH-on vs GDH-off usefulness metrics
+- Notes:
+  - This does not unroll training.
+  - Extra cost is one additional eval forward at logging points for `arch=gdh`.
+  - Training-step behavior is unchanged.
+
 ### 2026-04-05 — Entry 13 (add dedicated hard ClimbMix MPS launcher)
 - Date/time: 2026-04-05
 - Hypothesis:

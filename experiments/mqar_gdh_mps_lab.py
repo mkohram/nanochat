@@ -228,7 +228,7 @@ def _scan_accumulate(delta: torch.Tensor, scan_beta: float) -> torch.Tensor:
 
 
 def _slot_stats_last(sidecar: torch.Tensor, eps: float = 1e-9) -> dict[str, float]:
-    """Final-token slot geometry / usage stats, averaged across batch."""
+    """Final-token slot geometry / norm-share stats, averaged across batch."""
     s = sidecar.float()[:, -1]  # [B,R,D]
     norms = s.norm(dim=-1)  # [B,R]
     s_unit = s / norms.unsqueeze(-1).clamp_min(eps)
@@ -274,6 +274,57 @@ def _slot_stats_last(sidecar: torch.Tensor, eps: float = 1e-9) -> dict[str, floa
         "participation_ratio": float(vals[5]),
         "slot_norm_mean": float(vals[6]),
         "slot_norm_cv": float(vals[7]),
+    }
+
+
+def _share_stats(share: torch.Tensor, eps: float = 1e-9) -> dict[str, float]:
+    share = share.float()
+    entropy = -(share.clamp_min(eps) * share.clamp_min(eps).log()).sum(dim=-1)
+    effective_slots = entropy.exp()
+    max_share = share.max(dim=-1).values
+    participation_ratio = share.pow(2).sum(dim=-1).clamp_min(eps).reciprocal()
+
+    vals = torch.stack([
+        entropy.mean(),
+        effective_slots.mean(),
+        max_share.mean(),
+        participation_ratio.mean(),
+    ]).cpu().tolist()
+    return {
+        "entropy": float(vals[0]),
+        "effective_slots": float(vals[1]),
+        "max_share": float(vals[2]),
+        "participation_ratio": float(vals[3]),
+    }
+
+
+def _routing_stats(weights: torch.Tensor, eps: float = 1e-9) -> dict[str, float]:
+    """Attention/load stats from actual routing weights over slots.
+
+    `weights` may be shaped `[B,N,R]` or `[B,N,H,R]`. The last dimension must be slots.
+    Tokenwise attention concentration is computed over the flattened leading dimensions.
+    Load stats aggregate the same weights over all leading dimensions before measuring slot share.
+    """
+    if weights.ndim < 2:
+        raise ValueError("routing weights must have at least 2 dimensions")
+
+    r = weights.shape[-1]
+    flat = weights.float().reshape(-1, r)
+    token_share = flat / flat.sum(dim=-1, keepdim=True).clamp_min(eps)
+    token_stats = _share_stats(token_share, eps=eps)
+
+    load = flat.sum(dim=0, keepdim=True)
+    load_share = load / load.sum(dim=-1, keepdim=True).clamp_min(eps)
+    load_stats = _share_stats(load_share, eps=eps)
+
+    return {
+        "attn_entropy": token_stats["entropy"],
+        "attn_effective_slots": token_stats["effective_slots"],
+        "attn_max_share": token_stats["max_share"],
+        "attn_participation_ratio": token_stats["participation_ratio"],
+        "load_effective_slots": load_stats["effective_slots"],
+        "load_max_share": load_stats["max_share"],
+        "load_participation_ratio": load_stats["participation_ratio"],
     }
 
 
@@ -376,7 +427,8 @@ def _read_from_sidecar(
     sidecar_prev: torch.Tensor,
     *,
     eps: float,
-) -> torch.Tensor:
+    return_alpha: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reduced GDH read path used by this lab harness.
 
     This is intentionally implemented locally in the probe so GDH-side math lives in
@@ -404,7 +456,10 @@ def _read_from_sidecar(
     if getattr(read_core, "use_read_mute_gate", True):
         read_mute = torch.sigmoid(torch.matmul(x_read, read_core.W_g_read_mute) + read_core.b_g_read_mute)
         z_proj = read_mute * z_proj
-    return local + z_proj
+    out = local + z_proj
+    if return_alpha:
+        return out, alpha
+    return out
 
 
 def _apply_write_brain_local(write_core, delta: torch.Tensor, *, eps: float) -> torch.Tensor:
@@ -781,6 +836,7 @@ def _forward_gdh(
     collect_sidecar: bool,
     compute_topk: bool,
     compute_mrr: bool,
+    disable_gdh: bool = False,
 ):
     bsz, n_tokens = idx.size()
 
@@ -802,15 +858,38 @@ def _forward_gdh(
     layer_participation_ratio = []
     layer_slot_norm_mean = []
     layer_slot_norm_cv = []
+    layer_write_attn_effective_slots = []
+    layer_write_attn_max_share = []
+    layer_write_load_effective_slots = []
+    layer_write_load_max_share = []
+    layer_read_attn_effective_slots = []
+    layer_read_attn_max_share = []
+    layer_read_load_effective_slots = []
+    layer_read_load_max_share = []
     layer_sidecar_norm_trace = []
     layer_sidecar_last = []
     layer_out_state_hist = []
 
     for i, block in enumerate(model.transformer.h):
         x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
-        x = _read_from_sidecar(model.gdh_read[i], x, sidecar, eps=1e-6)
+        read_alpha = None
+        if not disable_gdh:
+            read_out = _read_from_sidecar(
+                model.gdh_read[i],
+                x,
+                sidecar,
+                eps=1e-6,
+                return_alpha=collect_sidecar,
+            )
+            if collect_sidecar:
+                x, read_alpha = read_out
+            else:
+                x = read_out
         ve = model.value_embeds[str(i)](idx) if str(i) in model.value_embeds else None
         x = block(x, ve, cos_sin, model.window_sizes[i], kv_cache=None)
+
+        if disable_gdh:
+            continue
 
         delta, alpha = _write_delta(
             model.gdh_write[i],
@@ -838,6 +917,10 @@ def _forward_gdh(
 
         if collect_sidecar:
             slot_stats = _slot_stats_last(sidecar)
+            write_attn_stats = _routing_stats(alpha)
+            write_load_stats = _routing_stats(alpha.mean(dim=2))
+            read_stats = _routing_stats(read_alpha) if read_alpha is not None else None
+
             layer_slot_cos.append(slot_stats["slot_cos_mean"])
             layer_slot_cos_max.append(slot_stats["slot_cos_max"])
             layer_slot_cos_p90.append(slot_stats["slot_cos_p90"])
@@ -846,6 +929,14 @@ def _forward_gdh(
             layer_participation_ratio.append(slot_stats["participation_ratio"])
             layer_slot_norm_mean.append(slot_stats["slot_norm_mean"])
             layer_slot_norm_cv.append(slot_stats["slot_norm_cv"])
+            layer_write_attn_effective_slots.append(write_attn_stats["attn_effective_slots"])
+            layer_write_attn_max_share.append(write_attn_stats["attn_max_share"])
+            layer_write_load_effective_slots.append(write_load_stats["load_effective_slots"])
+            layer_write_load_max_share.append(write_load_stats["load_max_share"])
+            layer_read_attn_effective_slots.append(None if read_stats is None else read_stats["attn_effective_slots"])
+            layer_read_attn_max_share.append(None if read_stats is None else read_stats["attn_max_share"])
+            layer_read_load_effective_slots.append(None if read_stats is None else read_stats["load_effective_slots"])
+            layer_read_load_max_share.append(None if read_stats is None else read_stats["load_max_share"])
             layer_sidecar_norm_trace.append(sidecar[0].float().norm(dim=-1).cpu().tolist())
             layer_sidecar_last.append(sidecar[0, -1].float().cpu().tolist())
             layer_out_state_hist.append(_out_state_hist_last(sidecar))
@@ -859,7 +950,7 @@ def _forward_gdh(
     future_summary_loss = sidecar.new_zeros(())
     future_summary_pred_norm = sidecar.new_zeros(())
     total_loss = ce_loss
-    if future_summary_lambda > 0.0:
+    if future_summary_lambda > 0.0 and not disable_gdh:
         future_summary_loss, future_summary_pred_norm = _future_summary_loss(
             model,
             sidecar,
@@ -872,6 +963,26 @@ def _forward_gdh(
     metrics = _compute_answer_metrics(logits, targets, eval_topk=eval_topk, compute_topk=compute_topk, compute_mrr=compute_mrr)
     if collect_sidecar:
         stats = {
+            "state_slot_cos_mean_last_per_layer": layer_slot_cos,
+            "state_slot_cos_max_last_per_layer": layer_slot_cos_max,
+            "state_slot_cos_p90_last_per_layer": layer_slot_cos_p90,
+            "state_effective_slots_last_per_layer": layer_effective_slots,
+            "state_max_share_last_per_layer": layer_max_share,
+            "state_participation_ratio_last_per_layer": layer_participation_ratio,
+            "state_slot_norm_mean_last_per_layer": layer_slot_norm_mean,
+            "state_slot_norm_cv_last_per_layer": layer_slot_norm_cv,
+            "write_attn_effective_slots_last_per_layer": layer_write_attn_effective_slots,
+            "write_attn_max_share_last_per_layer": layer_write_attn_max_share,
+            "write_load_effective_slots_last_per_layer": layer_write_load_effective_slots,
+            "write_load_max_share_last_per_layer": layer_write_load_max_share,
+            "read_attn_effective_slots_last_per_layer": layer_read_attn_effective_slots,
+            "read_attn_max_share_last_per_layer": layer_read_attn_max_share,
+            "read_load_effective_slots_last_per_layer": layer_read_load_effective_slots,
+            "read_load_max_share_last_per_layer": layer_read_load_max_share,
+            "sidecar_norm_trace_sample0_last_per_layer": layer_sidecar_norm_trace,
+            "sidecar_last_sample0_last_per_layer": layer_sidecar_last,
+            "out_state_hist_last_per_layer": layer_out_state_hist,
+            # Backward-compatible aliases kept for existing dashboard/history readers.
             "slot_cos_mean_last_per_layer": layer_slot_cos,
             "slot_cos_max_last_per_layer": layer_slot_cos_max,
             "slot_cos_p90_last_per_layer": layer_slot_cos_p90,
@@ -880,9 +991,6 @@ def _forward_gdh(
             "slot_participation_ratio_last_per_layer": layer_participation_ratio,
             "slot_norm_mean_last_per_layer": layer_slot_norm_mean,
             "slot_norm_cv_last_per_layer": layer_slot_norm_cv,
-            "sidecar_norm_trace_sample0_last_per_layer": layer_sidecar_norm_trace,
-            "sidecar_last_sample0_last_per_layer": layer_sidecar_last,
-            "out_state_hist_last_per_layer": layer_out_state_hist,
         }
     else:
         stats = None
@@ -961,6 +1069,8 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             or (args.full_metrics_every > 0 and step % args.full_metrics_every == 0)
         )
         model.eval()
+        gdh_off_ce = None
+        gdh_off_metrics = None
         with torch.no_grad():
             with ac:
                 if args.arch == "baseline":
@@ -992,6 +1102,25 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
                         compute_topk=full_metrics,
                         compute_mrr=full_metrics,
                     )
+                    _, gdh_off_ce, gdh_off_metrics, _, _ = _forward_gdh(
+                        model,
+                        eval_idx,
+                        eval_tgt,
+                        eval_next,
+                        scan_beta=beta,
+                        route_topk=args.route_topk,
+                        write_routing=args.write_routing,
+                        state_mixer=args.state_mixer,
+                        write_cooloff_lambda=args.write_cooloff_lambda,
+                        write_cooloff_rho=args.write_cooloff_rho,
+                        future_summary_horizon=args.future_summary_horizon,
+                        future_summary_lambda=args.future_summary_lambda,
+                        eval_topk=args.eval_topk,
+                        collect_sidecar=False,
+                        compute_topk=full_metrics,
+                        compute_mrr=full_metrics,
+                        disable_gdh=True,
+                    )
 
         wall_time_s = time.perf_counter() - run_start_time
         eval_scalars = torch.stack([eval_total.detach(), eval_ce.detach()]).cpu().tolist()
@@ -1014,24 +1143,75 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
         }
         topk_key = f"acc_top{max(1, min(args.eval_topk, args.vocab_size))}"
         rec[f"eval_{topk_key}"] = None if eval_metrics[topk_key] is None else float(eval_metrics[topk_key])
+        if gdh_off_ce is not None and gdh_off_metrics is not None:
+            rec["eval_gdh_off_ce"] = float(gdh_off_ce.detach().float().cpu())
+            rec["eval_gdh_off_acc_top1"] = float(gdh_off_metrics["acc_top1"])
+            rec["eval_mem_delta_ce"] = rec["eval_gdh_off_ce"] - rec["eval_ce"]
+            rec["eval_mem_delta_acc_top1"] = rec["eval_acc_top1"] - rec["eval_gdh_off_acc_top1"]
+            rec["eval_gdh_off_mrr"] = None if gdh_off_metrics["mrr"] is None else float(gdh_off_metrics["mrr"])
+            rec["eval_mem_delta_mrr"] = None if rec["eval_mrr"] is None or rec["eval_gdh_off_mrr"] is None else rec["eval_mrr"] - rec["eval_gdh_off_mrr"]
+            rec[f"eval_gdh_off_{topk_key}"] = None if gdh_off_metrics[topk_key] is None else float(gdh_off_metrics[topk_key])
+        else:
+            rec["eval_gdh_off_ce"] = None
+            rec["eval_gdh_off_acc_top1"] = None
+            rec["eval_gdh_off_mrr"] = None
+            rec["eval_mem_delta_ce"] = None
+            rec["eval_mem_delta_acc_top1"] = None
+            rec["eval_mem_delta_mrr"] = None
+            rec[f"eval_gdh_off_{topk_key}"] = None
 
         if args.arch == "gdh":
-            rec["slot_cos_l_last"] = float(stats["slot_cos_mean_last_per_layer"][-1])
-            rec["slot_cos_layers"] = [float(v) for v in stats["slot_cos_mean_last_per_layer"]]
-            rec["slot_cos_max_layers"] = [float(v) for v in stats["slot_cos_max_last_per_layer"]]
-            rec["slot_cos_p90_layers"] = [float(v) for v in stats["slot_cos_p90_last_per_layer"]]
-            rec["slot_usage_effective_slots_layers"] = [float(v) for v in stats["slot_usage_effective_slots_last_per_layer"]]
-            rec["slot_usage_max_share_layers"] = [float(v) for v in stats["slot_usage_max_share_last_per_layer"]]
-            rec["slot_participation_ratio_layers"] = [float(v) for v in stats["slot_participation_ratio_last_per_layer"]]
-            rec["slot_norm_mean_layers"] = [float(v) for v in stats["slot_norm_mean_last_per_layer"]]
-            rec["slot_norm_cv_layers"] = [float(v) for v in stats["slot_norm_cv_last_per_layer"]]
+            rec["state_slot_cos_l_last"] = float(stats["state_slot_cos_mean_last_per_layer"][-1])
+            rec["state_slot_cos_layers"] = [float(v) for v in stats["state_slot_cos_mean_last_per_layer"]]
+            rec["state_slot_cos_max_layers"] = [float(v) for v in stats["state_slot_cos_max_last_per_layer"]]
+            rec["state_slot_cos_p90_layers"] = [float(v) for v in stats["state_slot_cos_p90_last_per_layer"]]
+            rec["state_effective_slots_layers"] = [float(v) for v in stats["state_effective_slots_last_per_layer"]]
+            rec["state_max_share_layers"] = [float(v) for v in stats["state_max_share_last_per_layer"]]
+            rec["state_participation_ratio_layers"] = [float(v) for v in stats["state_participation_ratio_last_per_layer"]]
+            rec["state_slot_norm_mean_layers"] = [float(v) for v in stats["state_slot_norm_mean_last_per_layer"]]
+            rec["state_slot_norm_cv_layers"] = [float(v) for v in stats["state_slot_norm_cv_last_per_layer"]]
+            rec["write_attn_effective_slots_layers"] = [float(v) for v in stats["write_attn_effective_slots_last_per_layer"]]
+            rec["write_attn_max_share_layers"] = [float(v) for v in stats["write_attn_max_share_last_per_layer"]]
+            rec["write_load_effective_slots_layers"] = [float(v) for v in stats["write_load_effective_slots_last_per_layer"]]
+            rec["write_load_max_share_layers"] = [float(v) for v in stats["write_load_max_share_last_per_layer"]]
+            rec["read_attn_effective_slots_layers"] = [float(v) for v in stats["read_attn_effective_slots_last_per_layer"]]
+            rec["read_attn_max_share_layers"] = [float(v) for v in stats["read_attn_max_share_last_per_layer"]]
+            rec["read_load_effective_slots_layers"] = [float(v) for v in stats["read_load_effective_slots_last_per_layer"]]
+            rec["read_load_max_share_layers"] = [float(v) for v in stats["read_load_max_share_last_per_layer"]]
             rec["sidecar_norm_trace_layers"] = stats.get("sidecar_norm_trace_sample0_last_per_layer", [])
             rec["sidecar_last_layers"] = stats.get("sidecar_last_sample0_last_per_layer", [])
             rec["out_state_hist_layers"] = stats.get("out_state_hist_last_per_layer", [])
             rec["out_state_hist"] = rec["out_state_hist_layers"][-1] if rec["out_state_hist_layers"] else None
             rec["out_state_stats_layers"] = [h.get("stats", {}) for h in rec["out_state_hist_layers"] if isinstance(h, dict)]
             rec["out_state_stats"] = rec["out_state_stats_layers"][-1] if rec["out_state_stats_layers"] else None
+            # Backward-compatible aliases for existing readers.
+            rec["slot_cos_l_last"] = rec["state_slot_cos_l_last"]
+            rec["slot_cos_layers"] = rec["state_slot_cos_layers"]
+            rec["slot_cos_max_layers"] = rec["state_slot_cos_max_layers"]
+            rec["slot_cos_p90_layers"] = rec["state_slot_cos_p90_layers"]
+            rec["slot_usage_effective_slots_layers"] = rec["state_effective_slots_layers"]
+            rec["slot_usage_max_share_layers"] = rec["state_max_share_layers"]
+            rec["slot_participation_ratio_layers"] = rec["state_participation_ratio_layers"]
+            rec["slot_norm_mean_layers"] = rec["state_slot_norm_mean_layers"]
+            rec["slot_norm_cv_layers"] = rec["state_slot_norm_cv_layers"]
         else:
+            rec["state_slot_cos_l_last"] = None
+            rec["state_slot_cos_layers"] = []
+            rec["state_slot_cos_max_layers"] = []
+            rec["state_slot_cos_p90_layers"] = []
+            rec["state_effective_slots_layers"] = []
+            rec["state_max_share_layers"] = []
+            rec["state_participation_ratio_layers"] = []
+            rec["state_slot_norm_mean_layers"] = []
+            rec["state_slot_norm_cv_layers"] = []
+            rec["write_attn_effective_slots_layers"] = []
+            rec["write_attn_max_share_layers"] = []
+            rec["write_load_effective_slots_layers"] = []
+            rec["write_load_max_share_layers"] = []
+            rec["read_attn_effective_slots_layers"] = []
+            rec["read_attn_max_share_layers"] = []
+            rec["read_load_effective_slots_layers"] = []
+            rec["read_load_max_share_layers"] = []
             rec["slot_cos_l_last"] = None
             rec["slot_cos_layers"] = []
             rec["slot_cos_max_layers"] = []
@@ -1079,15 +1259,24 @@ def run_one_beta(args: argparse.Namespace, beta: float, device: str) -> dict[str
             except Exception:
                 pass
 
-        cos_txt = "n/a" if rec["slot_cos_l_last"] is None else f"{rec['slot_cos_l_last']:.4f}"
+        cos_txt = "n/a" if rec["state_slot_cos_l_last"] is None else f"{rec['state_slot_cos_l_last']:.4f}"
         mrr_txt = "n/a" if rec["eval_mrr"] is None else f"{rec['eval_mrr']:.4f}"
+        mem_dce_txt = ""
+        if rec["eval_mem_delta_ce"] is not None:
+            mem_dce_txt = f" mem_dce={rec['eval_mem_delta_ce']:.4f}"
+        wload_txt = ""
+        if rec["write_load_max_share_layers"]:
+            wload_txt = f" wload_max={rec['write_load_max_share_layers'][-1]:.4f}"
+        rload_txt = ""
+        if rec["read_load_max_share_layers"]:
+            rload_txt = f" rload_max={rec['read_load_max_share_layers'][-1]:.4f}"
         fs_txt = ""
         if args.future_summary_lambda > 0.0:
             fs_txt = f" eval_fs={rec['eval_future_summary_loss']:.4f}"
         print(
             f"[{run_label}] step={step} eval_acc1={rec['eval_acc_top1']:.4f} "
-            f"eval_mrr={mrr_txt} eval_ce={rec['eval_ce']:.4f}{fs_txt} "
-            f"slot_cos={cos_txt} lr={rec['lr']:.6g}",
+            f"eval_mrr={mrr_txt} eval_ce={rec['eval_ce']:.4f}{fs_txt}{mem_dce_txt}"
+            f" slot_cos={cos_txt}{wload_txt}{rload_txt} lr={rec['lr']:.6g}",
             flush=True,
         )
 

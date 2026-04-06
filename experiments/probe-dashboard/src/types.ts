@@ -25,6 +25,29 @@ export type ProbeHistoryPoint = {
   train_future_summary_pred_norm?: number
   train_acc_top1?: number
   train_mrr?: number
+  eval_gdh_off_ce?: number | null
+  eval_gdh_off_acc_top1?: number | null
+  eval_gdh_off_mrr?: number | null
+  eval_mem_delta_ce?: number | null
+  eval_mem_delta_acc_top1?: number | null
+  eval_mem_delta_mrr?: number | null
+  state_slot_cos_l_last?: number | null
+  state_slot_cos_layers?: number[]
+  state_slot_cos_max_layers?: number[]
+  state_slot_cos_p90_layers?: number[]
+  state_effective_slots_layers?: number[]
+  state_max_share_layers?: number[]
+  state_participation_ratio_layers?: number[]
+  state_slot_norm_mean_layers?: number[]
+  state_slot_norm_cv_layers?: number[]
+  write_attn_effective_slots_layers?: number[]
+  write_attn_max_share_layers?: number[]
+  write_load_effective_slots_layers?: number[]
+  write_load_max_share_layers?: number[]
+  read_attn_effective_slots_layers?: number[]
+  read_attn_max_share_layers?: number[]
+  read_load_effective_slots_layers?: number[]
+  read_load_max_share_layers?: number[]
   slot_cos_l_last?: number | null
   slot_cos_layers?: number[]
   slot_cos_max_layers?: number[]

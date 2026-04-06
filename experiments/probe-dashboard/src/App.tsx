@@ -79,6 +79,12 @@ function carryForward(values: Array<number | null | undefined>): Array<number | 
   })
 }
 
+function lastNumber(values: unknown): number | null {
+  if (!Array.isArray(values) || values.length === 0) return null
+  const v = values[values.length - 1]
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
 function vocabRandomTop1(vocabSize: unknown): number | null {
   return typeof vocabSize === 'number' && Number.isFinite(vocabSize) && vocabSize > 0 ? 1 / vocabSize : null
 }
@@ -348,6 +354,10 @@ export function App() {
       train_ce: trainCe,
       eval_future_summary_loss: evalFutureSummaryLoss,
       train_future_summary_loss: trainFutureSummaryLoss,
+      eval_gdh_off_ce: typeof row.eval_gdh_off_ce === 'number' ? row.eval_gdh_off_ce : null,
+      eval_gdh_off_acc_top1: typeof row.eval_gdh_off_acc_top1 === 'number' ? row.eval_gdh_off_acc_top1 : null,
+      eval_mem_delta_ce: typeof row.eval_mem_delta_ce === 'number' ? row.eval_mem_delta_ce : null,
+      eval_mem_delta_acc_top1: typeof row.eval_mem_delta_acc_top1 === 'number' ? row.eval_mem_delta_acc_top1 : null,
       eval_ppl: ceToPpl(evalCe),
       train_ppl: ceToPpl(trainCe),
       full_metrics: Boolean(row.full_metrics),
@@ -375,7 +385,7 @@ export function App() {
   )
   const histData = histOverlayData(last?.out_state_hist_layers)
   const histLayerCount = last?.out_state_hist_layers?.length ?? 0
-  const slotCosMaxP90Data = layerSeriesDual(history, 'slot_cos_max_layers', 'slot_cos_p90_layers')
+  const slotCosMaxP90Data = layerSeriesDual(history, 'state_slot_cos_max_layers', 'state_slot_cos_p90_layers')
   const availableHeatmapLayers = Math.max(last?.sidecar_norm_trace_layers?.length ?? 0, last?.sidecar_last_layers?.length ?? 0)
   const selectedHeatmapLayer = Math.min(heatmapLayer, Math.max(0, availableHeatmapLayers - 1))
   const sidecarNormTrace = (last?.sidecar_norm_trace_layers?.[selectedHeatmapLayer] as number[][] | undefined) ?? []
@@ -415,9 +425,11 @@ export function App() {
         <StatCard title="Eval top1" value={fmt(last?.eval_acc_top1)} subtitle={`MRR ${fmt(last?.eval_mrr)}`} />
         <StatCard title="Eval total" value={fmt(last?.eval_total)} subtitle={`Train total ${fmt(last?.train_total)}`} />
         <StatCard title="Eval CE" value={fmt(last?.eval_ce)} subtitle={`Train CE ${fmt(last?.train_ce)}`} />
-        <StatCard title="Eval future loss" value={fmt(last?.eval_future_summary_loss)} subtitle={`Train future loss ${fmt(last?.train_future_summary_loss)}`} />
+        <StatCard title="GDH-off CE" value={fmt(last?.eval_gdh_off_ce)} subtitle={`ΔCE ${fmt(last?.eval_mem_delta_ce)}`} />
+        <StatCard title="GDH-off top1" value={fmt(last?.eval_gdh_off_acc_top1)} subtitle={`Δtop1 ${fmt(last?.eval_mem_delta_acc_top1)}`} />
         <StatCard title="Eval PPL" value={fmt(ceToPpl(last?.eval_ce), 2)} subtitle={`Train PPL ${fmt(ceToPpl(last?.train_ce), 2)}`} />
-        <StatCard title="Slot cosine" value={fmt(last?.slot_cos_l_last)} subtitle="last layer" />
+        <StatCard title="State slot cosine" value={fmt(last?.state_slot_cos_l_last ?? last?.slot_cos_l_last)} subtitle="last layer" />
+        <StatCard title="Write load max" value={fmt(lastNumber(last?.write_load_max_share_layers))} subtitle={`Read load max ${fmt(lastNumber(last?.read_load_max_share_layers))}`} />
         <StatCard title="Out abs max" value={fmt(last?.out_state_stats?.abs_max)} subtitle={`std ${fmt(last?.out_state_stats?.std)}`} />
       </div>
 
@@ -544,6 +556,25 @@ export function App() {
           </div>
         </Panel>
 
+        <Panel title="GDH-on vs GDH-off eval CE / top1 deltas">
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <LineChart data={learningData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="step" />
+                <YAxis yAxisId="left" tickFormatter={(v) => fmt(v, 2)} width={54} />
+                <YAxis yAxisId="right" orientation="right" domain={[-1, 1]} tickFormatter={(v) => fmt(v, 2)} width={54} />
+                <Tooltip formatter={(value: unknown) => fmt(value, 4)} />
+                <Legend />
+                <Line type="monotone" dataKey="eval_ce" name="eval_ce" stroke="#dc2626" dot={false} strokeWidth={2} connectNulls yAxisId="left" />
+                <Line type="monotone" dataKey="eval_gdh_off_ce" name="eval_gdh_off_ce" stroke="#f59e0b" dot={false} strokeWidth={2} connectNulls yAxisId="left" />
+                <Line type="monotone" dataKey="eval_mem_delta_ce" name="eval_mem_delta_ce" stroke="#16a34a" dot={false} strokeWidth={2} connectNulls yAxisId="left" />
+                <Line type="monotone" dataKey="eval_mem_delta_acc_top1" name="eval_mem_delta_acc_top1" stroke="#7c3aed" dot={false} strokeWidth={2} connectNulls yAxisId="right" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
+
         <Panel title="Train vs eval future-summary loss">
           <div className="chart-wrap">
             <ResponsiveContainer>
@@ -577,9 +608,9 @@ export function App() {
         </Panel>
       </div>
 
-      <div className="section-title">Collapse</div>
+      <div className="section-title">State geometry</div>
       <div className="chart-grid two-up">
-        <Panel title="Layer-wise slot cosine (max and p90 off-diag)">
+        <Panel title="Layer-wise state slot cosine (max and p90 off-diag)">
           <div className="chart-wrap">
             <ResponsiveContainer>
               <LineChart data={slotCosMaxP90Data}>
@@ -600,11 +631,11 @@ export function App() {
           </div>
         </Panel>
         {[
-          ['Layer-wise slot cosine (mean off-diag)', 'slot_cos_layers'],
-          ['Effective slots (exp entropy)', 'slot_usage_effective_slots_layers'],
-          ['Max slot share', 'slot_usage_max_share_layers'],
-          ['Participation ratio', 'slot_participation_ratio_layers'],
-          ['Slot norm mean', 'slot_norm_mean_layers'],
+          ['Layer-wise state slot cosine (mean off-diag)', 'state_slot_cos_layers'],
+          ['State effective slots (norm-share exp entropy)', 'state_effective_slots_layers'],
+          ['State max share (norm-share)', 'state_max_share_layers'],
+          ['State participation ratio', 'state_participation_ratio_layers'],
+          ['State slot norm mean', 'state_slot_norm_mean_layers'],
         ].map(([title, key]) => {
           const data = layerSeries(history, key)
           return (
@@ -643,6 +674,40 @@ export function App() {
             </ResponsiveContainer>
           </div>
         </Panel>
+      </div>
+
+      <div className="section-title">Routing and load</div>
+      <div className="chart-grid two-up">
+        {[
+          ['Write load effective slots', 'write_load_effective_slots_layers'],
+          ['Write load max share', 'write_load_max_share_layers'],
+          ['Write attention effective slots', 'write_attn_effective_slots_layers'],
+          ['Write attention max share', 'write_attn_max_share_layers'],
+          ['Read load effective slots', 'read_load_effective_slots_layers'],
+          ['Read load max share', 'read_load_max_share_layers'],
+          ['Read attention effective slots', 'read_attn_effective_slots_layers'],
+          ['Read attention max share', 'read_attn_max_share_layers'],
+        ].map(([title, key]) => {
+          const data = layerSeries(history, key)
+          return (
+            <Panel key={key} title={title}>
+              <div className="chart-wrap">
+                <ResponsiveContainer>
+                  <LineChart data={data}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="step" />
+                    <YAxis />
+                    <Tooltip />
+                    <Legend />
+                    {Object.keys(data[0] ?? {}).filter((k) => k.startsWith('layer_')).map((seriesKey, idx) => (
+                      <Line key={seriesKey} type="monotone" dataKey={seriesKey} stroke={LAYER_COLORS[idx % LAYER_COLORS.length]} dot={false} />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </Panel>
+          )
+        })}
       </div>
 
       <div className="section-title">Sidecar heatmaps</div>
